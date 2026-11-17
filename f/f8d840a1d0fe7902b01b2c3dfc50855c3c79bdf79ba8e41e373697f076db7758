@@ -1,0 +1,1148 @@
+// Talaş Atölyesi · işleme simülasyonu (freze: yükseklik haritası CAM, torna: profil)
+import * as THREE from './lib/three.module.min.js';
+import { OrbitControls } from './lib/OrbitControls.js';
+
+// ---------------------------------------------------------------- yardımcılar
+function rng(seed) { let a = 0; for (const ch of String(seed)) a = (Math.imul(a ^ ch.charCodeAt(0), 2654435761) + 0x9e3779b9) >>> 0;
+  return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const STD_EM = [1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20];
+const STD_DR = [1.5, 2, 2.5, 3, 3.3, 4.2, 5, 5.5, 6, 6.8, 8, 8.5, 10, 10.2, 12, 14, 16];
+const near = (arr, v, down = true) => { let best = arr[0]; for (const a of arr) if (down ? a <= v + 1e-6 : true) best = Math.abs(a - v) < Math.abs(best - v) || (down && a <= v) ? a : best; return best; };
+const pickDown = (arr, v) => { let b = arr[0]; for (const a of arr) if (a <= v + 1e-6) b = a; return b; };
+const TOOL_COLORS = ['#4c9aff', '#ffd43b', '#38d9a9', '#9775fa', '#ff922b', '#f783ac', '#69db7c', '#22b8cf', '#fa5252', '#e599f7', '#ffa94d', '#74c0fc'];
+function matInfo(mat) {
+  const m = mat || '';
+  if (/Paslanmaz/.test(m)) return { col: '#aeb4bc', ap: 0.35, f: 0.45, name: 'paslanmaz' };
+  if (/Titan/.test(m)) return { col: '#9ea3a8', ap: 0.25, f: 0.3, name: 'titanyum' };
+  if (/Çelik/.test(m)) return { col: '#9aa1aa', ap: 0.4, f: 0.55, name: 'çelik' };
+  if (/Pirinç/.test(m)) return { col: '#d9b45a', ap: 0.7, f: 1.1, name: 'pirinç' };
+  if (/Bakır/.test(m)) return { col: '#c98455', ap: 0.6, f: 0.9, name: 'bakır' };
+  if (/POM|PEEK|Delrin|Plastik|Naylon/i.test(m)) return { col: /PEEK/.test(m) ? '#c8b48a' : '#ece9df', ap: 0.9, f: 1.4, name: 'plastik' };
+  return { col: '#c9ced6', ap: 0.8, f: 1.0, name: 'alüminyum' };
+}
+
+// Euclid uzaklık dönüşümü (Felzenszwalb), mask=1 olan hücrelere uzaklığın karesi (hücre birimi)
+function edt(mask, nx, ny) {
+  const INF = 1e20, f = new Float64Array(Math.max(nx, ny)), d = new Float64Array(Math.max(nx, ny)), v = new Int32Array(Math.max(nx, ny)), z = new Float64Array(Math.max(nx, ny) + 1);
+  const out = new Float64Array(nx * ny);
+  const pass = (n) => { let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < n; q++) { let s; while (true) { const p = v[k]; s = ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p); if (s <= z[k]) { k--; if (k < 0) { k = 0; break; } } else break; }
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF; }
+    k = 0; for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; const p = v[k]; d[q] = (q - p) * (q - p) + f[p]; } };
+  for (let i = 0; i < nx; i++) { for (let j = 0; j < ny; j++) f[j] = mask[j * nx + i] ? 0 : INF; pass(ny); for (let j = 0; j < ny; j++) out[j * nx + i] = d[j]; }
+  for (let j = 0; j < ny; j++) { for (let i = 0; i < nx; i++) f[i] = out[j * nx + i]; pass(nx); for (let i = 0; i < nx; i++) out[j * nx + i] = d[i]; }
+  return out;
+}
+
+// ================================================================ FREZE: hedef geometri
+// gerçek NC verisi: zlib(başlık json + voksel zaman kodları + anahtar kareler)
+async function loadNC(url) {
+  const r = await fetch(url); if (!r.ok) throw new Error('NC verisi bulunamadı');
+  if (typeof DecompressionStream === 'undefined') throw new Error('Bu tarayıcı sıkıştırılmış veriyi açamıyor');
+  let ab; if (/\.json(\?|$)/.test(url)) { const j = await r.json(), bs = atob(j.z); ab = new Uint8Array(bs.length); for (let i = 0; i < bs.length; i++) ab[i] = bs.charCodeAt(i); } else ab = await r.arrayBuffer();
+  const buf = await new Response(new Blob([ab]).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer();
+  const dv = new DataView(buf), hl = dv.getUint32(0, true);
+  const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hl)));
+  let off = 4 + hl; off += (4 - off % 4) % 4; let si = 0;
+  const take = () => { const o = off, n = hdr.sizes[si++]; off += n; off += (4 - off % 4) % 4; return o; };
+  for (const op of hdr.ops) { const N = op.n[0] * op.n[1] * op.n[2], K = op.kf;
+    op.code = new Uint16Array(buf, take(), N); op.gt = new Uint8Array(buf, take(), N);
+    op.kt = new Float32Array(buf, take(), K); op.kp = new Float32Array(buf, take(), K * 3); op.kbc = new Int16Array(buf, take(), K * 2);
+    op.ktool = new Uint8Array(buf, take(), K); op.kcut = new Uint8Array(buf, take(), K); }
+  return hdr;
+}
+async function loadHM(url, meta) {
+  const [nx, ny, cell, L, W, H] = meta;
+  const img = new Image(); img.src = url; await img.decode();
+  const cv = document.createElement('canvas'); cv.width = nx; cv.height = ny; const g = cv.getContext('2d', { willReadFrequently: true });
+  g.drawImage(img, 0, 0); const px = g.getImageData(0, 0, nx, ny).data;
+  const T = new Float32Array(nx * ny), Bt = new Float32Array(nx * ny), M = new Uint8Array(nx * ny);
+  for (let c = 0; c < nx * ny; c++) { M[c] = px[c * 4 + 3] > 127 ? 1 : 0; T[c] = px[c * 4] / 255 * H; Bt[c] = px[c * 4 + 1] / 255 * H; }
+  return { nx, ny, cell, L, W, H, T, B: Bt, M, real: true };
+}
+// Görseli olmayan freze işleri için tohumdan parça üret
+function procMill(job) {
+  const r = rng('m' + job.id);
+  const L = job.L, W = job.W, H = job.H;
+  const cell = Math.max(Math.max(L, W) / 150, 0.2), nx = Math.ceil(L / cell) + 1, ny = Math.ceil(W / cell) + 1;
+  const T = new Float32Array(nx * ny).fill(H), Bt = new Float32Array(nx * ny).fill(0), M = new Uint8Array(nx * ny).fill(1);
+  const X = i => i * cell, Y = j => j * cell;
+  const each = (fn) => { for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) fn(j * nx + i, X(i), Y(j)); };
+  const rr = Math.max(job.minr || 1, 0.5);
+  const inRR = (x, y, x0, y0, x1, y1, rad) => { if (x < x0 || x > x1 || y < y0 || y > y1) return false;
+    const cx = clamp(x, x0 + rad, x1 - rad), cy = clamp(y, y0 + rad, y1 - rad); return (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad; };
+  // dış kontur: köşe radyüsü ya da pah, bazen yan basamak/çentik
+  const cr = r() < 0.6 ? Math.min(L, W) * (0.04 + r() * 0.12) : 0;
+  each((c, x, y) => { if (!inRR(x, y, 0, 0, L, W, Math.max(cr, 0.01))) M[c] = 0; });
+  const kind = job.kind || 'plaka';
+  if (kind === 'braket' || r() < 0.3) { // L-basamak
+    const sx = L * (0.3 + r() * 0.35), sh = H * (0.3 + r() * 0.4), side = r() < 0.5;
+    each((c, x) => { if (side ? x > L - sx : x < sx) T[c] = Math.min(T[c], sh); });
+  }
+  if (r() < 0.45) { // kenar çentiği
+    const nw = W * (0.2 + r() * 0.25), nd = L * (0.08 + r() * 0.12), ny0 = W / 2 - nw / 2, atEnd = r() < 0.5;
+    each((c, x, y) => { if (y > ny0 && y < ny0 + nw && (atEnd ? x > L - nd : x < nd)) M[c] = 0; });
+  }
+  // cepler
+  const npk = kind === 'plaka' ? 1 + Math.floor(r() * 3) : kind === 'kapak' ? 1 : Math.floor(r() * 3);
+  for (let k = 0; k < npk; k++) {
+    const pw = L * (0.2 + r() * 0.35), ph = W * (0.2 + r() * 0.35), px = L * 0.12 + r() * (L * 0.76 - pw), py = W * 0.12 + r() * (W * 0.76 - ph);
+    const depth = H * (kind === 'kapak' ? 0.75 : 0.25 + r() * 0.45), through = kind === 'plaka' && r() < 0.25;
+    each((c, x, y) => { if (inRR(x, y, px, py, px + pw, py + ph, Math.min(rr * 1.5, pw / 3, ph / 3))) { if (through) M[c] = 0; else T[c] = Math.min(T[c], H - depth); } });
+  }
+  // kanal
+  if (job.kanal != null && r() < 0.8) {
+    const kw = Math.max(job.kanal * 3, Math.min(L, W) * 0.06), horiz = r() < 0.6, pos = (horiz ? W : L) * (0.25 + r() * 0.5), kd = H * (0.2 + r() * 0.3);
+    each((c, x, y) => { const d = horiz ? Math.abs(y - pos) : Math.abs(x - pos); if (d < kw / 2 && x > L * 0.08 && x < L * 0.92) T[c] = Math.min(T[c], H - kd); });
+  }
+  // delikler (görünür sayı sınırlı)
+  const nh = Math.min(job.holes || 0, 24);
+  const pts = [];
+  if (nh >= 4 && r() < 0.6) { const ins = Math.min(L, W) * 0.12; pts.push([ins, ins], [L - ins, ins], [ins, W - ins], [L - ins, W - ins]); }
+  let guard = 0;
+  while (pts.length < nh && guard++ < 400) { const x = L * (0.08 + r() * 0.84), y = W * (0.08 + r() * 0.84); if (pts.every(p => Math.hypot(p[0] - x, p[1] - y) > Math.min(L, W) * 0.1)) pts.push([x, y]); }
+  const hd = clamp(Math.min(L, W) * (0.05 + r() * 0.05), 2.5, 14);
+  for (const [hx, hy] of pts.slice(0, nh)) { const blind = r() < 0.35, d = hd * (0.7 + r() * 0.6);
+    each((c, x, y) => { if ((x - hx) ** 2 + (y - hy) ** 2 <= (d / 2) ** 2 && M[c]) { if (blind) T[c] = Math.min(T[c], T[c] - Math.min(d * 2, H * 0.6)); else M[c] = 0; } }); }
+  // alt yüz özellikleri (2+ bağlama)
+  if ((job.bag || 1) >= 2) {
+    const bw = L * (0.3 + r() * 0.4), bh = W * (0.3 + r() * 0.4), bx = (L - bw) / 2, by = (W - bh) / 2, bd = H * (0.15 + r() * 0.3);
+    each((c, x, y) => { if (M[c] && inRR(x, y, bx, by, bx + bw, by + bh, Math.min(rr * 2, bw / 3)) && T[c] > bd + 0.5) Bt[c] = bd; });
+  }
+  return { nx, ny, cell, L, W, H, T, B: Bt, M, real: false };
+}
+
+// ================================================================ FREZE: CAM
+// Stok ızgarası parça çerçevesinde: z yukarı, (0,0,0) stok alt köşesi.
+function planMill(tg, job) {
+  const mi = matInfo(job.mat), rnd = rng('c' + job.id);
+  const c = tg.cell, Mg = Math.ceil(Math.max(2, 0.05 * Math.max(tg.L, tg.W)) / c);
+  const nx = tg.nx + 2 * Mg, ny = tg.ny + 2 * Mg, N = nx * ny;
+  const two = (job.bag || 1) >= 2;
+  const zb0 = two ? Math.min(2, 0.15 * tg.H + 0.5) : 0, at = Math.min(1.5, 0.1 * tg.H + 0.3), Hs = zb0 + tg.H + at;
+  const TT = new Float32Array(N), TB = new Float32Array(N), TE = new Uint8Array(N).fill(1);
+  for (let j = 0; j < tg.ny; j++) for (let i = 0; i < tg.nx; i++) { const s = j * tg.nx + i, d = (j + Mg) * nx + i + Mg;
+    if (tg.M[s]) { TE[d] = 0; TT[d] = zb0 + tg.T[s]; TB[d] = zb0 + tg.B[s]; if (TT[d] - TB[d] < 0.15) TE[d] = 1; } }
+  // dış boşluk (kenardan ulaşılan) / iç boşluk ayrımı
+  const OUT = new Uint8Array(N); const st = [];
+  for (let i = 0; i < nx; i++) { st.push(i, (ny - 1) * nx + i); } for (let j = 0; j < ny; j++) { st.push(j * nx, j * nx + nx - 1); }
+  while (st.length) { const k = st.pop(); if (OUT[k] || !TE[k]) continue; OUT[k] = 1; const i = k % nx, j = (k / nx) | 0;
+    if (i > 0) st.push(k - 1); if (i < nx - 1) st.push(k + 1); if (j > 0) st.push(k - nx); if (j < ny - 1) st.push(k + nx); }
+  const minDim = Math.min(tg.L, tg.W);
+  const Dr = pickDown(STD_EM, clamp(minDim / 4.5, 3, 16));
+  const Df = pickDown(STD_EM, clamp(Math.min(2 * Math.max(job.minr || 1.5, 0.5), Dr / 2), 1, 8));
+  const tools = [];
+  const T = (kind, d, name) => { const k = tools.findIndex(t => t.kind === kind && t.d === d); if (k >= 0) return k; tools.push({ kind, d, name, col: TOOL_COLORS[tools.length % TOOL_COLORS.length] }); return tools.length - 1; };
+  const feed = { rough: 1400 * mi.f, fin: 900 * mi.f, drill: 220 * mi.f, face: 1800 * mi.f };
+  const setups = [];
+  const plan = { top: new Float32Array(N).fill(Hs), bot: new Float32Array(N) };
+  const nSet = two ? 2 : 1;
+  for (let s = 0; s < nSet; s++) {
+    const moves = [], ops = []; let curTool = -1;
+    const frame = (k) => s === 0 ? k : (ny - 1 - ((k / nx) | 0)) * nx + (k % nx);   // setup çerçevesindeki k -> parça hücresi
+    const Ct = new Float32Array(N), G = new Float32Array(N);
+    const sync = () => { for (let k = 0; k < N; k++) { const p = frame(k); Ct[k] = plan.top[p] <= plan.bot[p] + 1e-4 ? -2 : s === 0 ? plan.top[p] : Hs - plan.bot[p]; } };
+    sync();
+    for (let k = 0; k < N; k++) { const p = frame(k);
+      if (!TE[p]) G[k] = s === 0 ? TT[p] : Hs - TB[p];
+      else if (OUT[p]) G[k] = s === 0 ? (two ? zb0 + 0.4 * tg.H : -0.6) : -0.6;
+      else G[k] = -0.6; }
+    let zf = -1e9; for (let k = 0; k < N; k++) if (!TE[frame(k)]) zf = Math.max(zf, G[k]);
+    const G2 = G.slice(); { const lab = new Int32Array(N).fill(-1), st2 = [];
+      for (let s0 = 0; s0 < N; s0++) { if (lab[s0] >= 0) continue; const g0 = G[s0], cp = []; lab[s0] = s0; st2.push(s0); let rim = 1e9, edge = false;
+        while (st2.length) { const k = st2.pop(); cp.push(k); const i = k % nx, j = (k / nx) | 0; if (i === 0 || j === 0 || i === nx - 1 || j === ny - 1) edge = true;
+          for (const q of [i > 0 ? k - 1 : -1, i < nx - 1 ? k + 1 : -1, j > 0 ? k - nx : -1, j < ny - 1 ? k + nx : -1]) { if (q < 0) continue;
+            if (Math.abs(G[q] - g0) < 0.05) { if (lab[q] < 0) { lab[q] = s0; st2.push(q); } } else rim = Math.min(rim, G[q]); } }
+        if (edge || cp.length > 900 || rim < g0 + 0.3) continue;
+        let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9; for (const k of cp) { const i = k % nx, j = (k / nx) | 0; x0 = Math.min(x0, i); x1 = Math.max(x1, i); y0 = Math.min(y0, j); y1 = Math.max(y1, j); }
+        const w = (x1 - x0 + 1) * c, h = (y1 - y0 + 1) * c, deq = 2 * Math.sqrt(cp.length * c * c / Math.PI);
+        if (deq <= 16 && deq >= 0.8 && Math.max(w, h) / Math.min(w, h) <= 1.6) for (const k of cp) G2[k] = rim; } }
+    const safe = Hs + 8;
+    const op = (name, tool) => { ops.push({ name, tool, at: moves.length }); curTool = tool; };
+    const mv = (x, y, z, f) => moves.push([x, y, z, f, curTool, s]);
+    // planlama durumunu güncelle (oynatmadaki ile aynı kesme)
+    const cutSeg = (p, q, tool) => stampPlan(plan, nx, ny, c, p, q, tools[tool], s, Hs);
+    // takım durumu: cur = kesme seviyesindeki konum (null = yukarıda)
+    const clr = Hs + 2; let cur = null, up = 'safe';
+    const liveTop = (k) => { const p = frame(k); return plan.top[p] <= plan.bot[p] + 1e-4 ? -2 : s === 0 ? plan.top[p] : Hs - plan.bot[p]; };
+    const matUnder = (x, y, r, z) => { let m = -1e9; const i0 = Math.max(0, Math.floor((x - r) / c)), i1 = Math.min(nx - 1, Math.ceil((x + r) / c)), j0 = Math.max(0, Math.floor((y - r) / c)), j1 = Math.min(ny - 1, Math.ceil((y + r) / c));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const k = j * nx + i; if ((i * c - x) ** 2 + (j * c - y) ** 2 <= r * r && G2[k] <= z + 0.02) { const t = liveTop(k); if (t > m) m = t; } } return m; };
+    const lift = (h) => { if (cur) { mv(cur[0], cur[1], h || clr, 0); cur = null; up = h === safe ? 'safe' : 'clr'; } };
+    const feedTo = (x, y, z, f, tool) => { const p = cur; mv(x, y, z, f); if (p) cutSeg(p, [x, y, z], tool); cur = [x, y, z]; };
+    const enter = (x, y, z, ux, uy, room, f, tool) => {          // yukarıdan (x,y,z)'ye in: boşlukta düz, malzemede rampayla
+      mv(x, y, clr, 0); up = 'clr';
+      const D = tools[tool].d, top = matUnder(x, y, D / 2, z);
+      if (top <= z + 0.05) { mv(x, y, Math.max(z, top) + 1, 0); cur = [x, y, Math.max(z, top) + 1]; feedTo(x, y, z, f * 0.5, tool); return; }
+      const z0 = Math.min(clr, top + 0.6); mv(x, y, z0, 0); cur = [x, y, z0];
+      const Lr = Math.min(room, D * 2.5);
+      if (Lr < D * 0.45) { feedTo(x, y, z, f * 0.2, tool); return; }       // dar yer: yavaş dalış
+      let zc = z0, far = false;
+      while (zc > z + 1e-3) { zc = Math.max(z, zc - Lr * 0.07); far = !far; feedTo(far ? x + ux * Lr : x, far ? y + uy * Lr : y, zc, f * 0.5, tool); }
+      if (far) feedTo(x, y, z, f, tool); };
+    const linkOk = (a, b, A) => { const L = Math.hypot(b[0] - a[0], b[1] - a[1]), n = Math.max(1, Math.ceil(L / (c * 0.5)));
+      for (let t = 0; t <= n; t++) { const i = Math.round((a[0] + (b[0] - a[0]) * t / n) / c), j = Math.round((a[1] + (b[1] - a[1]) * t / n) / c); if (i < 0 || j < 0 || i >= nx || j >= ny) continue; if (!A[j * nx + i]) return false; } return true; };
+    // izinli bölge içinde en kısa yol (8 komşu), sonra görüş hattıyla sadeleştir
+    const PREV = new Int32Array(N), SEEN = new Uint32Array(N), QQ = new Int32Array(N); let stamp = 0;
+    const bfsLink = (a, b, A, maxD) => { const ia = clamp(Math.round(a[0] / c), 0, nx - 1), ja = clamp(Math.round(a[1] / c), 0, ny - 1), ib = clamp(Math.round(b[0] / c), 0, nx - 1), jb = clamp(Math.round(b[1] / c), 0, ny - 1);
+      const s0 = ja * nx + ia, t0 = jb * nx + ib; if (!A[s0] || !A[t0]) return null; stamp++; let qh = 0, qt = 0; QQ[qt++] = s0; SEEN[s0] = stamp; PREV[s0] = -1; let found = false, vis = 0; const lim = N;
+      while (qh < qt) { const k = QQ[qh++]; if (k === t0) { found = true; break; } if (++vis > lim) break; const i = k % nx, j = (k / nx) | 0;
+        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { if (!di && !dj) continue; const ii = i + di, jj = j + dj; if (ii < 0 || jj < 0 || ii >= nx || jj >= ny) continue; const q = jj * nx + ii;
+          if (A[q] && SEEN[q] !== stamp) { SEEN[q] = stamp; PREV[q] = k; QQ[qt++] = q; } } }
+      if (!found) return null; const cells = []; for (let k = t0; k >= 0; k = PREV[k]) cells.push(k); cells.reverse();
+      if (cells.length * c > maxD) return null;
+      const pts = cells.map(k => [(k % nx) * c, ((k / nx) | 0) * c]); pts[0] = [a[0], a[1]]; pts[pts.length - 1] = [b[0], b[1]];
+      const out = [pts[0]]; let i0 = 0; while (i0 < pts.length - 1) { let j = pts.length - 1; while (j > i0 + 1 && !linkOk(pts[i0], pts[j], A)) j--; out.push(pts[j]); i0 = j; } return out; };
+    const moveTo = (x, y, z, f, tool, A, ux, uy, room) => {   // aynı seviyede kalkmadan geç; olmazsa kalk-taşı-gir
+      if (cur && Math.abs(cur[2] - z) < 1e-6) {
+        if (!A || linkOk(cur, [x, y], A)) { feedTo(x, y, z, f, tool); return; }
+        for (const m of [[x, cur[1]], [cur[0], y]]) if (linkOk(cur, m, A) && linkOk(m, [x, y], A)) { feedTo(m[0], m[1], z, f, tool); feedTo(x, y, z, f, tool); return; }
+        const wp = bfsLink(cur, [x, y], A, Math.max(60, tools[tool].d * 40)); if (wp) { for (let k = 1; k < wp.length; k++) feedTo(wp[k][0], wp[k][1], z, f, tool); return; } }
+      lift(); enter(x, y, z, ux, uy, room, f, tool); };
+    const endOp = () => { if (cur) { mv(cur[0], cur[1], safe, 0); cur = null; } up = 'safe'; };
+    const path = (pts, z, f, tool, A) => { if (!pts.length) return; const [x0, y0] = pts[0], p1 = pts[1] || pts[0], L1 = Math.hypot(p1[0] - x0, p1[1] - y0) || 1;
+      moveTo(x0, y0, z, f, tool, A, (p1[0] - x0) / L1, (p1[1] - y0) / L1, L1);
+      for (let k = 1; k < pts.length; k++) feedTo(pts[k][0], pts[k][1], z, f, tool); };
+    // --- alın frezeleme
+    let mx = -1e9; for (let k = 0; k < N; k++) if (Ct[k] > mx) mx = Ct[k];
+    if (mx > zf + 0.05) {
+      const W0 = ny * c, Df_ = W0 > 40 ? pickDown([20, 32, 40, 50, 63], W0 * 0.8) : Dr, ti = T(Df_ >= 20 ? 'face' : 'flat', Df_, Df_ >= 20 ? `Ø${Df_} tarama kafası` : `Ø${Df_} parmak freze`);
+      op(s === 0 ? 'Üst yüzey alın frezeleme' : 'Alt yüzey alın frezeleme (ölçüye getirme)', ti);
+      const so = Df_ * 0.7, passes = Math.max(1, Math.ceil((mx - zf) / 2));
+      for (let p = 1; p <= passes; p++) { const z = mx - (mx - zf) * p / passes; let dir = 0;
+        for (let y = -Df_ * 0.2; y <= ny * c + Df_ * 0.2; y += so) { const xa = -Df_ * 0.6, xb = nx * c + Df_ * 0.6; path(dir ? [[xb, y], [xa, y]] : [[xa, y], [xb, y]], z, feed.face, ti, null); dir ^= 1; } }
+      endOp(); sync();
+    }
+    // --- seviye listesi: sabit adım + belirgin taban yükseklikleri
+    const ap = clamp(Dr * 0.5 * mi.ap, 0.4, 6);
+    const hist = new Map(); let cnt = 0;
+    for (let k = 0; k < N; k++) if (G2[k] < zf - 0.05 && G2[k] > -0.5) { const h = Math.round(G2[k] * 10) / 10; hist.set(h, (hist.get(h) || 0) + 1); cnt++; }
+    let gmin = 1e9; for (let k = 0; k < N; k++) if (G2[k] < gmin) gmin = G2[k];
+    const levels = new Set(); for (let z = zf - ap; z > Math.max(gmin, -0.6) + 1e-3; z -= ap) levels.add(Math.round(z * 100) / 100);
+    for (const [h, n] of hist) if (n > Math.max(20, 0.01 * N)) levels.add(h);
+    levels.add(Math.round(Math.max(gmin, -0.6) * 100) / 100);
+    const LV = [...levels].filter(z => z < zf - 0.02).sort((a, b) => b - a);
+    // --- seviye bazlı boşaltma (tarama + kontur)
+    const clearing = (D, tool, name, f, restOnly) => {
+      let first = true;
+      for (const z of LV) {
+        const F = new Uint8Array(N); let any = false;
+        for (let k = 0; k < N; k++) { if (G2[k] > z + 0.01) F[k] = 1; }
+        const d2 = edt(F, nx, ny), R = D / 2 / c, R2 = (R + 0.05) * (R + 0.05);
+        const A = new Uint8Array(N); for (let k = 0; k < N; k++) if (d2[k] > R2) A[k] = 1;
+        // kesilecek malzeme var mı: takım dairesi içinde Ct > z
+        const need = new Uint8Array(N); const rc = Math.ceil(R);
+        for (let k = 0; k < N; k++) if (Ct[k] > z + 0.02 && G2[k] <= z + 0.01) { any = true; need[k] = 1; }
+        if (!any) continue;
+        // ihtiyaç bölgesini takım yarıçapı kadar genişlet
+        const nd2 = edt(need, nx, ny), NR2 = (R + 0.5) * (R + 0.5);
+        const so = Math.max(1, Math.round(D * (restOnly ? 0.45 : 0.6) / c));
+        let rowsOut = [];
+        for (let j = 0, dir = 0; j < ny; j += so) {
+          let i = 0; const runs = [];
+          while (i < nx) { while (i < nx && !(A[j * nx + i] && nd2[j * nx + i] <= NR2)) i++; const a = i; while (i < nx && A[j * nx + i] && nd2[j * nx + i] <= NR2) i++; if (i - a >= 1) runs.push([a, i - 1]); }
+          if (runs.length) rowsOut.push([j, runs]);
+        }
+        if (!rowsOut.length) continue;
+        if (first) { op(name, tool); first = false; }
+        let dir = 0;
+        for (const [j, runs] of rowsOut) { const rr = dir ? runs.slice().reverse() : runs;
+          for (const [a, b] of rr) { const pa = [(dir ? b : a) * c, j * c], pb = [(dir ? a : b) * c, j * c]; path([pa, pb], z, f, tool, A); } dir ^= 1; }
+        // kontur: izin verilen bölgenin sınırı (ihtiyaç olan yerde)
+        const Bd = new Uint8Array(N);
+        for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) { const k = j * nx + i; if (A[k] && nd2[k] <= NR2 && (!A[k - 1] || !A[k + 1] || !A[k - nx] || !A[k + nx])) Bd[k] = 1; }
+        for (const loop of chains(Bd, nx, ny)) { if (loop.length < 3) continue; path(loop.map(k => [(k % nx) * c, ((k / nx) | 0) * c]), z, f * 0.8, tool, A); }
+        sync();
+      }
+      if (!first) endOp();
+    };
+    clearing(Dr, T('flat', Dr, `Ø${Dr} parmak freze (kaba)`), 'Kaba boşaltma', feed.rough, false);
+    if (Df < Dr) clearing(Df, T('flat', Df, `Ø${Df} parmak freze (finiş)`), 'Finiş ve köşe temizleme', feed.fin, true);
+    // --- 3B yüzeyler: küresel uçla tarama
+    let curved = 0; const CV = new Uint8Array(N);
+    for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) { const k = j * nx + i; if (G[k] < -0.5) continue;
+      const gx = (G[k + 1] - G[k - 1]) / (2 * c), gy = (G[k + nx] - G[k - nx]) / (2 * c), g = Math.hypot(gx, gy);
+      if (g > 0.03 && g < 2.5 && Math.abs(G[k + 1] - G[k - 1]) < 3 * c && Math.abs(G[k + nx] - G[k - nx]) < 3 * c) { CV[k] = 1; curved++; } }
+    if (curved > 0.02 * N) {
+      const Db = pickDown(STD_EM, clamp(Df * 2, 2, 8)), Rb = Db / 2, ti = T('ball', Db, `Ø${Db} küresel uç freze`); op('3B yüzey finişi', ti);
+      const rc = Math.ceil(Rb / c), cvd = edt(CV, nx, ny), lim = (rc + 1) ** 2;
+      const so = Math.max(1, Math.round(Db * 0.3 / c)); let dir = 0, rows = 0;
+      for (let j = 0; j < ny && rows < 90; j += so) { let pts = [];
+        const flush = () => { if (pts.length > 1) { const p0 = pts[0];
+            if (cur && Math.hypot(p0[0] - cur[0], p0[1] - cur[1]) <= so * c * 1.6 && Math.abs(p0[2] - cur[2]) < Db) feedTo(p0[0], p0[1], p0[2], feed.fin, ti);
+            else { lift(); mv(p0[0], p0[1], clr, 0); mv(p0[0], p0[1], p0[2] + 1, 0); cur = [p0[0], p0[1], p0[2] + 1]; feedTo(p0[0], p0[1], p0[2], feed.fin * 0.4, ti); }
+            for (let k = 1; k < pts.length; k++) feedTo(pts[k][0], pts[k][1], pts[k][2], feed.fin, ti); } else if (pts.length) lift(); pts = []; };
+        const I = dir ? [...Array(nx).keys()].reverse() : [...Array(nx).keys()];
+        for (const i of I) { const k = j * nx + i; if (cvd[k] > lim) { flush(); continue; }
+          let zt = -1e9; for (let dj = -rc; dj <= rc; dj++) { const jj = j + dj; if (jj < 0 || jj >= ny) continue; for (let di = -rc; di <= rc; di++) { const ii = i + di; if (ii < 0 || ii >= nx) continue;
+            const dd = (di * di + dj * dj) * c * c; if (dd > Rb * Rb) continue; const h = G[jj * nx + ii] + Math.sqrt(Rb * Rb - dd) - Rb; if (h > zt) zt = h; } }
+          pts.push([i * c, j * c, zt]); }
+        flush(); dir ^= 1; rows++; }
+      endOp(); sync();
+    }
+    // --- delme: kalan küçük yuvarlak boşluklar
+    const rest = new Uint8Array(N); for (let k = 0; k < N; k++) if (Ct[k] > G[k] + 0.3 && Ct[k] > -1) rest[k] = 1;
+    const comps = components(rest, nx, ny);
+    const holes = [];
+    for (const cp of comps) { if (cp.length < 2) continue; let sx = 0, sy = 0, x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, zb = 1e9, zt = -1e9;
+      for (const k of cp) { const i = k % nx, j = (k / nx) | 0; sx += i; sy += j; x0 = Math.min(x0, i); x1 = Math.max(x1, i); y0 = Math.min(y0, j); y1 = Math.max(y1, j); zb = Math.min(zb, G[k]); zt = Math.max(zt, Ct[k]); }
+      const w = (x1 - x0 + 1) * c, h = (y1 - y0 + 1) * c, deq = 2 * Math.sqrt(cp.length * c * c / Math.PI);
+      if (deq > 16 || deq < 0.8 || Math.max(w, h) / Math.min(w, h) > 1.6) continue;
+      holes.push({ x: sx / cp.length * c, y: sy / cp.length * c, d: pickDown(STD_DR, Math.max(1.5, Math.min(w, h) * 1.02)), zt, zb: Math.max(zb, -0.6) }); }
+    if (holes.length) {
+      const sp = T('spot', 6, 'Ø6 punta matkabı (90°)'); op('Punta', sp);
+      for (const hl of holes) { mv(hl.x, hl.y, clr, 0); mv(hl.x, hl.y, hl.zt + 2, 0); mv(hl.x, hl.y, hl.zt - Math.min(hl.d / 2, 2.5), feed.drill); stampPlan(plan, nx, ny, c, [hl.x, hl.y, hl.zt + 2], [hl.x, hl.y, hl.zt - Math.min(hl.d / 2, 2.5)], tools[sp], s, Hs); mv(hl.x, hl.y, clr, 0); }
+      endOp(); mv(holes[holes.length - 1].x, holes[holes.length - 1].y, safe, 0);
+      const bySize = new Map(); for (const hl of holes) { if (!bySize.has(hl.d)) bySize.set(hl.d, []); bySize.get(hl.d).push(hl); }
+      for (const [d, hs] of [...bySize].sort((a, b) => a[0] - b[0])) { const ti = T('drill', d, `Ø${d} matkap`); op(`Delme Ø${d}`, ti);
+        for (const hl of hs) { mv(hl.x, hl.y, clr, 0); mv(hl.x, hl.y, hl.zt + 2, 0); const pk = Math.max(d * 1.5, 2); let z = hl.zt;
+          while (z > hl.zb + 1e-3) { const zn = Math.max(hl.zb, z - pk); mv(hl.x, hl.y, zn, feed.drill); stampPlan(plan, nx, ny, c, [hl.x, hl.y, z + 0.5], [hl.x, hl.y, zn], tools[ti], s, Hs); if (zn > hl.zb) mv(hl.x, hl.y, hl.zt + 1, 0), mv(hl.x, hl.y, zn + 0.5, 0); z = zn; }
+          mv(hl.x, hl.y, clr, 0); } mv(hs[hs.length - 1].x, hs[hs.length - 1].y, safe, 0); }
+      sync();
+    }
+    setups.push({ moves, ops, jawTop: s === 0 ? (two ? zb0 + 0.3 * tg.H : Math.min(Hs * 0.3, 4)) : at + 0.5 * tg.H });
+  }
+  for (const S of setups) for (const m of S.moves) if (m[3] > 0 && m[4] >= 0) { const t = tools[m[4]]; t.reach = Math.max(t.reach || 0, Hs - m[2]); }
+  return { nx, ny, c, Hs, zb0, at, tools, setups, mat: mi, Mg, tg, TE, TT, TB, holesN: 0 };
+}
+// 8-komşulu bileşenler
+function components(mask, nx, ny) { const seen = new Uint8Array(nx * ny), out = [];
+  for (let s = 0; s < nx * ny; s++) { if (!mask[s] || seen[s]) continue; const cp = [], st = [s]; seen[s] = 1;
+    while (st.length) { const k = st.pop(); cp.push(k); const i = k % nx, j = (k / nx) | 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const ii = i + di, jj = j + dj; if (ii < 0 || jj < 0 || ii >= nx || jj >= ny) continue; const q = jj * nx + ii; if (mask[q] && !seen[q]) { seen[q] = 1; st.push(q); } } }
+    out.push(cp); } return out; }
+// sınır hücrelerini zincirle
+function chains(B, nx, ny) { const seen = new Uint8Array(nx * ny), out = []; const N4 = [1, -1, nx, -nx], N8 = [nx + 1, nx - 1, -nx + 1, -nx - 1];
+  for (let s = 0; s < nx * ny; s++) { if (!B[s] || seen[s]) continue; const ch = [s]; seen[s] = 1; let k = s;
+    while (true) { let nxt = -1; for (const d of N4) { const q = k + d; if (q >= 0 && q < nx * ny && B[q] && !seen[q]) { nxt = q; break; } }
+      if (nxt < 0) for (const d of N8) { const q = k + d; if (q >= 0 && q < nx * ny && B[q] && !seen[q]) { nxt = q; break; } }
+      if (nxt < 0) break; seen[nxt] = 1; ch.push(nxt); k = nxt; }
+    // kapanabiliyorsa kapat
+    const a = ch[0], b = ch[ch.length - 1]; if (ch.length > 4 && Math.abs((a % nx) - (b % nx)) <= 1 && Math.abs(((a / nx) | 0) - ((b / nx) | 0)) <= 1) ch.push(a);
+    out.push(ch.filter((_, i) => i % 2 === 0 || i === ch.length - 1)); }
+  return out; }
+
+// Malzeme kaldırma: takım ekseni setup çerçevesinde; dizi parça çerçevesinde
+function stampPlan(st, nx, ny, c, p, q, tool, s, Hs, CT, ci, dirty) {
+  const r = tool.d / 2, kind = tool.kind;
+  const x0 = Math.min(p[0], q[0]) - r, x1 = Math.max(p[0], q[0]) + r, y0 = Math.min(p[1], q[1]) - r, y1 = Math.max(p[1], q[1]) + r;
+  const i0 = Math.max(0, Math.floor(x0 / c)), i1 = Math.min(nx - 1, Math.ceil(x1 / c)), j0 = Math.max(0, Math.floor(y0 / c)), j1 = Math.min(ny - 1, Math.ceil(y1 / c));
+  if (i0 > i1 || j0 > j1) return false;
+  const dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2], L2 = dx * dx + dy * dy, r2 = r * r; let hit = false;
+  for (let j = j0; j <= j1; j++) { const y = j * c;
+    for (let i = i0; i <= i1; i++) { const x = i * c;
+      let t = 0; if (L2 > 1e-12) { t = ((x - p[0]) * dx + (y - p[1]) * dy) / L2; t = t < 0 ? 0 : t > 1 ? 1 : t; }
+      else t = dz < 0 ? 1 : 0;
+      const ex = x - (p[0] + t * dx), ey = y - (p[1] + t * dy), d2 = ex * ex + ey * ey; if (d2 > r2) continue;
+      let z = p[2] + t * dz;
+      if (kind === 'ball') z += r - Math.sqrt(r2 - d2); else if (kind === 'spot') z += Math.sqrt(d2); else if (kind === 'drill') z += Math.sqrt(d2) * 0.6;
+      const pj = s === 0 ? j : ny - 1 - j, k = pj * nx + i;
+      if (st.top[k] <= st.bot[k]) continue;
+      if (s === 0) { if (st.top[k] > z + 1e-4) { st.top[k] = Math.max(z, st.bot[k]); if (CT) CT[k] = ci; hit = true; if (dirty) dirty(pj); } }
+      else { const zp = Hs - z; if (st.bot[k] < zp - 1e-4) { st.bot[k] = Math.min(zp, st.top[k]); if (CT) CT[k + nx * ny] = ci; hit = true; if (dirty) dirty(pj); } }
+    } }
+  return hit;
+}
+
+// ================================================================ TORNA
+function procLathe(job) {
+  const r = rng('t' + job.id), D = job.dia || job.W || 40, L = job.L || 60, sh = job.shape || 'Mil';
+  const N = clamp(Math.round(L / 0.25), 120, 360), dz = L / (N - 1);
+  const ro = new Float32Array(N).fill(D / 2), ri = new Float32Array(N).fill(0);
+  const feat = { hex: null, flats: null, keyway: null, holesAx: null, holesRad: null, thread: null, ecc: null, angled: null };
+  const zAt = k => k * dz; const ch = (k0, k1, f) => { for (let k = Math.max(0, k0); k <= Math.min(N - 1, k1); k++) f(k, zAt(k)); };
+  const K = z => Math.round(clamp(z, 0, L) / dz);
+  const step = (z0, z1, rad) => ch(K(z0), K(z1), k => { ro[k] = Math.min(ro[k], rad); });
+  const chamf = (zEdge, dirIn, size) => ch(K(zEdge - size), K(zEdge + size), (k, z) => { const d = dirIn > 0 ? z - zEdge : zEdge - z; if (d >= 0 && d < size) ro[k] = Math.min(ro[k], ro[k] - (size - d)); });
+  const groove = (zc, w, depth) => ch(K(zc - w / 2), K(zc + w / 2), k => { ro[k] = Math.max(1, ro[k] - depth); });
+  const bore = (z0, z1, rad) => ch(K(z0), K(z1), k => { ri[k] = Math.max(ri[k], rad); });
+  const R = D / 2;
+  if (/Kademeli|Mil$|Kamalı|Anahtar|Eksantrik/.test(sh)) {
+    const nS = /Kademeli/.test(sh) ? 3 + Math.floor(r() * 3) : 1 + Math.floor(r() * 2); let z = 0, rad = R;
+    const lens = []; for (let i = 0; i < nS; i++) lens.push(0.5 + r());
+    const tot = lens.reduce((a, b) => a + b, 0) + 1.2;
+    // uçlarda inceltilmiş muylu
+    for (let i = 0; i < nS; i++) { const l = L * lens[i] / tot * 0.5; rad = Math.max(R * 0.35, rad * (0.72 + r() * 0.18)); step(L - (z + l), L - z, rad); z += l; }
+    if (r() < 0.6) step(0, L * 0.12, R * (0.7 + r() * 0.15));
+    if (r() < 0.6) groove(L * (0.3 + r() * 0.4), Math.max(1.2, D * 0.05), Math.max(0.6, D * 0.05));
+    if (r() < 0.5) feat.thread = { z0: L - L * 0.12, z1: L, p: clamp(D * 0.06, 0.8, 2.5) };
+    if (/Kamalı/.test(sh)) feat.keyway = { z0: L * 0.35, z1: L * 0.7, w: D * 0.25, d: D * 0.12 };
+    if (/Anahtar/.test(sh)) feat.flats = { z0: L * 0.25, z1: L * 0.45, s: D * 0.8 };
+    if (/Eksantrik/.test(sh)) feat.ecc = { z0: L * 0.35, z1: L * 0.65, e: D * 0.12, r: R * 0.7 };
+  } else if (/Burç|Radyal|Makara|Piston|Nipel|Manifold|Açılı/.test(sh)) {
+    const br = /Nipel/.test(sh) ? R * 0.45 : /Manifold|Açılı/.test(sh) ? R * 0.3 : R * (0.5 + r() * 0.2);
+    bore(0, L, br);
+    if (/Burç|Radyal/.test(sh) && r() < 0.6) step(0, L * 0.25, R * 0.85);
+    if (/Makara/.test(sh)) ch(K(L * 0.25), K(L * 0.75), (k, z) => { const t = Math.abs(z - L / 2) / (L * 0.25); ro[k] = Math.min(ro[k], R * (0.62 + 0.38 * t)); });
+    if (/Piston/.test(sh)) for (let g = 0; g < 3; g++) groove(L * (0.7 + g * 0.09), Math.max(1.5, D * 0.04), Math.max(1, D * 0.05));
+    if (/Nipel/.test(sh)) { step(0, L * 0.35, R * 0.8); feat.thread = { z0: 0, z1: L * 0.3, p: clamp(D * 0.06, 1, 2) }; feat.hexN = 1; }
+    if (/Radyal/.test(sh)) feat.holesRad = { z: L * 0.5, n: job.holes || 2, d: Math.max(2, D * 0.12) };
+    if (/Açılı|Manifold/.test(sh)) { feat.flats = { z0: L * 0.3, z1: L * 0.8, s: D * 0.82 }; feat.angled = { n: job.holes || 4, d: Math.max(3, D * 0.1) }; }
+    chamf(L, 1, Math.max(0.5, D * 0.03));
+  } else if (/Disk|flanş/i.test(sh)) {
+    const hub = /flanş/i.test(sh) ? R * (0.45 + r() * 0.15) : R; const hl = /flanş/i.test(sh) ? L * 0.55 : 0;
+    if (hl) step(L - hl, L, hub); bore(0, L, R * (0.2 + r() * 0.15));
+    if (/flanş/i.test(sh)) feat.holesAx = { n: job.holes || 6, pcd: (R + hub) * 0.95, d: Math.max(3, D * 0.06), z0: 0, z1: L - hl };
+  } else if (/Altıgen|rakor/i.test(sh)) {
+    bore(0, L, R * 0.45); step(L * 0.55, L, R * 0.72); feat.thread = { z0: L * 0.72, z1: L, p: clamp(D * 0.06, 1, 2) }; feat.hex = { z0: L * 0.05, z1: L * 0.5, s: D * 0.88 };
+  } else if (/Pim/.test(sh)) { step(0, L * 0.2, R * 0.75); chamf(L, 1, R * 0.25); }
+  chamf(L, 1, Math.max(0.3, D * 0.02));
+  return { N, dz, L, D, ro, ri, feat, shape: sh };
+}
+function planLathe(tp, job) {
+  const mi = matInfo(job.mat), Rs = pickDown([5, 6, 8, 10, 12, 16, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 110, 125], tp.D / 2 + 3) ;
+  const Rst = Math.max(Rs, tp.D / 2 + 1), face = 1.2, part = 3.5;
+  // stok: z -> parça koordinatı (0 = ayna tarafı / kesme yeri, L = alın)
+  const tools = []; const T = (kind, w, name) => { tools.push({ kind, w, name, col: TOOL_COLORS[tools.length % TOOL_COLORS.length] }); return tools.length - 1; };
+  const moves = [], ops = []; let cur = -1;
+  const op = (name, t) => { ops.push({ name, tool: t, at: moves.length }); cur = t; };
+  const mv = (x, z, f, kind = 'od') => moves.push([x, z, f, cur, kind]);
+  const fR = 0.25 * mi.f * 800, fF = 0.12 * mi.f * 800;
+  const zEnd = tp.L + face, zMin = -part;
+  // 1) alın tornalama
+  const tf = T('od', 0, 'Alın/dış çap kaba kater (CNMG)'); op('Alın tornalama', tf);
+  mv(Rst + 2, zEnd + 2, 0); mv(Rst + 2, tp.L, 0); mv(-0.5, tp.L, fR);
+  // 2) dış çap kaba pasolar
+  op('Dış çap kaba tornalama', tf);
+  const ap = clamp(1.5 * mi.ap, 0.5, 3); let rmin = 1e9; for (let k = 0; k < tp.N; k++) rmin = Math.min(rmin, tp.ro[k]);
+  for (let rr = Rst - ap; rr > rmin + 0.3; rr -= ap) {
+    // alından başlayıp hedefin rr'den küçük olduğu en uzak noktaya kadar
+    let k = tp.N - 1; while (k > 0 && tp.ro[k] + 0.3 < rr) k--; if (k >= tp.N - 1) continue;
+    const zStop = (k + 1) * tp.dz; mv(rr + 1, tp.L + 1, 0); mv(rr, tp.L + 1, 0); mv(rr, zStop, fR); mv(rr + 1, zStop + 0.5, fR); mv(Rst + 2, tp.L + 2, 0);
+  }
+  // 3) dış profil finiş
+  const tfin = T('od', 0, 'Dış çap finiş kater (VNMG)'); op('Dış profil finiş', tfin);
+  mv(tp.ro[tp.N - 1] + 2, tp.L + 2, 0);
+  for (let k = tp.N - 1; k >= 0; k -= 2) mv(tp.ro[k], k * tp.dz, fF);
+  mv(Rst + 2, 0, 0); mv(Rst + 2, tp.L + 2, 0);
+  // 4) kanal (dar oluklar)
+  const grooves = []; for (let k = 2; k < tp.N - 2; k++) { if (tp.ro[k] < tp.ro[k - 2] - 0.4 && tp.ro[k] < tp.ro[k + 2] - 0.4) { const a = k; while (k < tp.N - 2 && tp.ro[k] < Math.min(tp.ro[a - 2], tp.ro[k + 2]) - 0.3) k++; grooves.push([a, k]); } }
+  // 5) delme / delik tornalama
+  let rimax = 0; for (let k = 0; k < tp.N; k++) rimax = Math.max(rimax, tp.ri[k]);
+  if (rimax > 0) {
+    const td = T('drill', Math.min(rimax * 2 * 0.9, 32), `Ø${Math.round(Math.min(rimax * 2 * 0.9, 32))} matkap`); op('Merkez delme', td);
+    const rd = Math.min(rimax * 0.9, 16); mv(0, tp.L + 3, 0, 'drill'); let z = tp.L; const pk = Math.max(rd * 2, 5);
+    while (z > -0.5) { z = Math.max(-0.5, z - pk); mv(0, z, fR * 0.25, 'drill'); mv(0, tp.L + 2, 0, 'drill'); if (z > -0.5) mv(0, z + 1, 0, 'drill'); }
+    if (rimax > rd + 0.2) { const tb = T('id', 0, 'Delik tornalama barası'); op('Delik tornalama', tb);
+      for (let rr = rd + 1; rr <= rimax + 1e-3; rr = Math.min(rimax, rr + ap)) { mv(rr - 0.5, tp.L + 2, 0, 'id'); mv(rr, tp.L + 1, 0, 'id'); mv(rr, -0.5, fR, 'id'); mv(rr - 0.5, -0.5, 0, 'id'); mv(rr - 0.5, tp.L + 2, 0, 'id'); if (rr >= rimax) break; } }
+  }
+  if (grooves.length) { const tg = T('groove', 2, 'Kanal kateri 2 mm'); op('Kanal açma', tg);
+    for (const [a, b] of grooves) { const za = a * tp.dz, zb = b * tp.dz; let rb = 1e9; for (let k = a; k <= b; k++) rb = Math.min(rb, tp.ro[k]);
+      for (let z = zb; z >= za - 1e-3; z -= 1.8) { mv(Rst + 1, z, 0); mv(rb, z, fF * 0.5); mv(Rst + 1, z, 0); } } }
+  if (tp.feat.thread) { const th = T('thread', 0, `Diş kateri · P${tp.feat.thread.p.toFixed(1)}`); op('Diş çekme', th);
+    const t = tp.feat.thread; for (let p = 0; p < 4; p++) { mv(Rst + 1, t.z1 + 2, 0); mv(tp.ro[Math.round(t.z1 / tp.dz) - 1] - p * 0.15, t.z1 + 2, 0); mv(tp.ro[Math.round(t.z1 / tp.dz) - 1] - p * 0.15, t.z0, 3000); mv(Rst + 1, t.z0, 0); } }
+  // 6) C/Y ekseni (döner takım)
+  const live = [];
+  if (tp.feat.hex) live.push(['hex', 'Altıgen frezeleme (C ekseni)']);
+  if (tp.feat.flats) live.push(['flats', 'Anahtar ağzı frezeleme (C ekseni)']);
+  if (tp.feat.keyway) live.push(['keyway', 'Kama kanalı frezeleme (Y ekseni)']);
+  if (tp.feat.ecc) live.push(['ecc', 'Eksantrik frezeleme (C+X)']);
+  if (tp.feat.holesAx) live.push(['holesAx', 'Eksenel delikler (C ekseni)']);
+  if (tp.feat.holesRad) live.push(['holesRad', 'Radyal delikler (döner takım)']);
+  if (tp.feat.angled) live.push(['angled', 'Açılı delikler (B ekseni)']);
+  for (const [k, name] of live) { const tl = T('live', 0, /delik/i.test(name) ? 'Döner matkap' : 'Döner parmak freze'); op(name, tl); mv(Rst + 3, tp.L * 0.5, 0, 'live:' + k); mv(Rst + 3, tp.L * 0.5, 600, 'live:' + k); }
+  // 7) kesme
+  const tp2 = T('part', 3, 'Kesme kateri 3 mm'); op('Kesme', tp2);
+  mv(Rst + 2, -1.5, 0, 'part'); mv(Math.max(0, rimax - 0.5), -1.5, fF * 0.4, 'part'); mv(Rst + 2, -1.5, 0, 'part');
+  return { tools, moves, ops, Rst, zMin, zEnd, face, mat: mi };
+}
+
+// ================================================================ GÖRÜNTÜLEYİCİ
+// ---------------------------------------------------------------- soğutma sıvısı + talaş parçacıkları
+function makeFX(scene, span, chipCol, floorAt) {
+  const pts = (n, col, size, op, add) => { const P = new Float32Array(n * 3).fill(-1e5), G = new THREE.BufferGeometry(); G.setAttribute('position', new THREE.BufferAttribute(P, 3));
+    const M = new THREE.PointsMaterial({ color: col, size, transparent: op < 1, opacity: op, depthWrite: op >= 1, blending: add ? THREE.AdditiveBlending : THREE.NormalBlending }); const o = new THREE.Points(G, M); o.frustumCulled = false; scene.add(o); return { P, G, M, o, V: new Float32Array(n * 3), L: new Float32Array(n), n, k: 0 }; };
+  const C = pts(1600, 0x9fd4ff, span * 0.018, 0.42, true), K = pts(700, chipCol, span * 0.02, 1, false), S = pts(500, 0xe4f4ff, span * 0.013, 0.6, true);
+  const jetMat = new THREE.MeshStandardMaterial({ color: 0xbfe6ff, transparent: true, opacity: 0.5, roughness: 0.1, metalness: 0, emissive: 0x335577, depthWrite: false });
+  const jets = []; const jetGeo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true); const UP = new THREE.Vector3(0, 1, 0);
+  const g = span * 4; let on = true, acc = 0;
+  const spawn = (B, x, y, z, vx, vy, vz, life) => { const k = B.k++ % B.n; B.P[k * 3] = x; B.P[k * 3 + 1] = y; B.P[k * 3 + 2] = z; B.V[k * 3] = vx; B.V[k * 3 + 1] = vy; B.V[k * 3 + 2] = vz; B.L[k] = life; return k; };
+  const stepB = (B, dt, drag, onFloor) => { for (let k = 0; k < B.n; k++) { if (B.L[k] <= 0) { B.P[k * 3 + 2] = -1e5; continue; } B.L[k] -= dt;
+      const i = k * 3; B.V[i + 2] -= g * dt; const d = Math.exp(-drag * dt); B.V[i] *= d; B.V[i + 1] *= d;
+      B.P[i] += B.V[i] * dt; B.P[i + 1] += B.V[i + 1] * dt; B.P[i + 2] += B.V[i + 2] * dt;
+      const f = floorAt(B.P[i], B.P[i + 1]); if (B.P[i + 2] < f) { B.P[i + 2] = f; onFloor(k, i); } }
+    B.G.attributes.position.needsUpdate = true; };
+  return {
+    setOn(b) { on = !!b; if (!on) { C.L.fill(0); S.L.fill(0); jets.forEach(j => j.visible = false); } },
+    get on() { return on; },
+    chips(x, y, z, n, vx0 = 0, vy0 = 0, vz0 = 0) { for (let j = 0; j < n; j++) { const a = Math.random() * 6.283, v = span * (0.25 + Math.random() * (on ? 0.5 : 0.9));
+        spawn(K, x, y, z, vx0 + Math.cos(a) * v, vy0 + Math.sin(a) * v, vz0 + span * (0.3 + Math.random() * (on ? 0.6 : 1.0)), 7 + Math.random() * 5); } },
+    step(dt, nozzles, target, flowing) {
+      while (jets.length < nozzles.length) { const j = new THREE.Mesh(jetGeo, jetMat); j.renderOrder = 2; scene.add(j); jets.push(j); }
+      jets.forEach((j, i) => { const nz = nozzles[i]; if (!on || !flowing || !nz) { j.visible = false; return; } const d = new THREE.Vector3().subVectors(target, nz), L = d.length();
+        j.visible = true; j.position.copy(nz).addScaledVector(d, 0.5); j.quaternion.setFromUnitVectors(UP, d.normalize()); const r = span * (0.005 + Math.random() * 0.0015); j.scale.set(r, L, r); });
+      if (dt <= 0) return;
+      if (on && flowing && nozzles.length) { acc += dt * 1100; while (acc >= 1) { acc--; const nz = nozzles[(Math.random() * nozzles.length) | 0];
+          let dx = target.x - nz.x, dy = target.y - nz.y, dz = target.z - nz.z; const L = Math.hypot(dx, dy, dz) || 1, sp = span * 2.4, j = 0.06;
+          dx = dx / L + (Math.random() - 0.5) * j; dy = dy / L + (Math.random() - 0.5) * j; dz = dz / L + (Math.random() - 0.5) * j;
+          const t0 = Math.random() * 0.02; spawn(C, nz.x + dx * sp * t0, nz.y + dy * sp * t0, nz.z + dz * sp * t0, dx * sp, dy * sp, dz * sp + g * 0.12, 1.4); } }
+      stepB(C, dt, 0.4, (k, i) => { // sıçrama: birkaç damla ve yerde kısa ömür
+        if (C.V[i + 2] < -span * 0.3 && Math.random() < 0.25) spawn(S, C.P[i], C.P[i + 1], C.P[i + 2] + span * 0.004, (Math.random() - 0.5) * span * 0.8, (Math.random() - 0.5) * span * 0.8, span * (0.2 + Math.random() * 0.4), 0.5);
+        C.V[i] *= 0.3; C.V[i + 1] *= 0.3; C.V[i + 2] = 0; C.L[k] = Math.min(C.L[k], 0.25); });
+      stepB(S, dt, 1.5, (k, i) => { S.L[k] = 0; });
+      stepB(K, dt, on ? 1.2 : 0.4, (k, i) => { K.V[i + 2] = 0; const fr = on ? 0.93 : 0.6; K.V[i] *= fr; K.V[i + 1] *= fr; if (on) { K.V[i] += (Math.random() - 0.5) * span * 0.02; K.V[i + 1] += span * 0.01; } });
+    } };
+}
+function hoseTo(THREE_, group, mat, a, b, r) { const dir = new THREE.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2]), L = dir.length();
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.7, r, L, 10), mat); m.position.set((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize()); group.add(m); return m; }
+
+export async function open(el, spec) {
+  const job = spec.job, lathe = job.src === 'lathe';
+  el.innerHTML = '';
+  const cv = document.createElement('canvas'); cv.style.cssText = 'width:100%;height:100%;display:block;touch-action:none'; el.appendChild(cv);
+  const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14171c);
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.5, 6000); camera.up.set(0, 0, 1);
+  const controls = new OrbitControls(camera, cv); controls.enableDamping = true;
+  scene.add(new THREE.HemisphereLight(0xe6eeff, 0x2a2622, 1.1));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024); sun.shadow.bias = -0.0005; scene.add(sun); scene.add(sun.target);
+  const fill = new THREE.DirectionalLight(0x9fb4ff, 0.5); scene.add(fill);
+  const M = (c, m = 0.4, r = 0.5) => new THREE.MeshStandardMaterial({ color: c, metalness: m, roughness: r });
+  const mSteel = M(0x6b7380, 0.6, 0.4), mDark = M(0x3a4049, 0.5, 0.55), mPaint = M(0x4a5260, 0.3, 0.55), mBody = M(0xdfe3e8, 0.1, 0.5), mBlack = M(0x1d2026, 0.3, 0.6);
+  const add = (geo, mat, x = 0, y = 0, z = 0, parent = scene) => { const o = new THREE.Mesh(geo, mat); o.position.set(x, y, z); o.castShadow = o.receiveShadow = true; parent.add(o); return o; };
+  const boxG = (w, d, h) => new THREE.BoxGeometry(w, d, h);
+  const fit = (cx, cy, cz, size, dx, dy, dz) => { const a = Math.max(0.3, (el.clientWidth || 390) / (el.clientHeight || 500)); const d = size / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.min(1, a)) * 1.08;
+    const v = new THREE.Vector3(dx, dy, dz).normalize().multiplyScalar(d); camera.position.set(cx + v.x, cy + v.y, cz + v.z); controls.target.set(cx, cy, cz); };
+  let api = null;
+  if (spec.nc) api = await buildNC(); else if (lathe) api = await buildLathe(); else api = await buildMill();
+
+  // ---------------------------------------------------------------- freze sahnesi
+  async function buildMill() {
+    let tg = null;
+    if (spec.hm && spec.hmMeta) { try { tg = await loadHM(spec.hm, spec.hmMeta); } catch (e) { tg = null; } }
+    if (!tg) tg = procMill(job);
+    const P = planMill(tg, job);
+    const { nx, ny, c, Hs } = P, N = nx * ny, SX = nx * c, SY = ny * c;
+    const st = { top: new Float32Array(N), bot: new Float32Array(N) }; const CT = new Uint8Array(2 * N);
+    const reset = () => { st.top.fill(Hs); st.bot.fill(0); CT.fill(0); };
+    reset();
+    const span = Math.max(SX, SY, Hs * 2), sc = clamp(span / 140, 0.4, 1.3);
+    // makine içi ortam yansıması (oda + ışık panelleri) — metal yüzeyler için
+    { const pm = new THREE.PMREMGenerator(renderer), es = new THREE.Scene();
+      es.add(new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial({ color: 0x45474a, side: THREE.BackSide })));
+      const lamp = (x, y, z, w, d, h, i) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, d, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(i, i, i) })); o.position.set(x, y, z); es.add(o); };
+      lamp(0, 0.8, 4.8, 7, 1.4, 0.1, 9); lamp(-4.8, -1, 1.6, 0.1, 4, 1.2, 2.6); lamp(4.8, 1.5, 2.2, 0.1, 3, 1.2, 2); lamp(0, -4.8, 2.4, 6, 0.1, 1.2, 1.6); lamp(0, 0, -4.8, 9, 9, 0.1, 0.18);
+      scene.environment = pm.fromScene(es, 0.035).texture; pm.dispose(); }
+    scene.traverse(o => { if (o.isHemisphereLight) { o.intensity = 0.45; o.color.set(0xffffff); o.groundColor.set(0x2b2b2b); } if (o.isDirectionalLight && o !== sun) o.color.set(0xdfe6ee); });
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.15;
+    scene.background = new THREE.Color(0x101318);
+    const mVise = M(0x4b5159, 0.4, 0.45), mGround = M(0xc5cbd2, 0.95, 0.2), mTable = M(0x6c737c, 0.65, 0.48), mSlot = M(0x23272d, 0.4, 0.75), mWall = M(0x8d939b, 0.45, 0.5), mBolt = M(0x1c1f24, 0.7, 0.35);
+    const jh = 36 * sc + 4, zBed = Math.min(...P.setups.map(S => S.jawTop)) - jh, bh = 52 * sc + 6, zT = zBed - bh;
+    const jawW = Math.max(SX * 0.8, 120 * sc), jawPl = 8 * sc + 2, jawBk = 22 * sc + 3;
+    const fix = new THREE.Group(); scene.add(fix);
+    // tabla: T kanallı
+    const tL = Math.max(span * 6, 720 * sc), tW = Math.max(span * 3.2, 400 * sc), tTh = 70 * sc, swd = 18 * sc, spc = 100 * sc, sd = 14 * sc;
+    add(boxG(tL, tW, tTh - sd), mTable, SX / 2, SY / 2, zT - sd - (tTh - sd) / 2, fix);
+    { const ns = Math.max(3, Math.floor(tW / spc)), ys = []; for (let k = 0; k < ns; k++) ys.push(SY / 2 + (k - (ns - 1) / 2) * spc);
+      let ya = SY / 2 - tW / 2; for (const yc of [...ys, null]) { const yb = yc === null ? SY / 2 + tW / 2 : yc - swd / 2;
+        if (yb > ya) add(boxG(tL, yb - ya, sd), mTable, SX / 2, (ya + yb) / 2, zT - sd / 2, fix);
+        if (yc !== null) { add(boxG(tL, swd, 0.6), mSlot, SX / 2, yc, zT - sd + 0.3, fix); ya = yc + swd / 2; } } }
+    // makine iç sacı (arka + yanlar; tek yüzlü: dışarıdan bakınca görünmez)
+    { const wy = SY / 2 + tW / 2 + 140 * sc, wz = zT + 260 * sc, WH = 900 * sc;
+      const wb = new THREE.Mesh(new THREE.PlaneGeometry(tL * 1.4, WH), mWall); wb.rotation.x = Math.PI / 2; wb.position.set(SX / 2, wy, wz); wb.receiveShadow = true; fix.add(wb);
+      for (const sg of [-1, 1]) { const w = new THREE.Mesh(new THREE.PlaneGeometry(WH, tW + 600 * sc), mWall); w.rotation.y = -sg * Math.PI / 2; w.position.set(SX / 2 + sg * tL * 0.7, SY / 2, wz); fix.add(w); }
+      const led = add(boxG(tL * 0.9, 6 * sc, 10 * sc), new THREE.MeshBasicMaterial({ color: 0xf2f6ff }), SX / 2, wy - 4 * sc, zT + 560 * sc, fix); led.castShadow = false;
+      add(boxG(tL * 1.4, tW + 600 * sc, 4), mSlot, SX / 2, SY / 2, zT - tTh - 140 * sc, fix); }
+    // mengene: gövde, yan kızaklar, vida, sabit + hareketli çene (taşlanmış plakalar)
+    const vy0 = -jawPl - jawBk - 14 * sc, vy1 = SY + jawPl + jawBk + 160 * sc, vx0 = SX / 2 - jawW / 2 - 8 * sc, vx1 = SX / 2 + jawW / 2 + 8 * sc;
+    add(boxG(vx1 - vx0, vy1 - vy0, bh), mVise, SX / 2, (vy0 + vy1) / 2, zBed - bh / 2, fix);
+    for (const sg of [-1, 1]) add(boxG(12 * sc, vy1 - vy0 + 20 * sc, bh * 0.4), mVise, SX / 2 + sg * (jawW / 2 + 14 * sc), (vy0 + vy1) / 2, zT + bh * 0.2, fix);
+    add(boxG(jawW * 0.86, (vy1 - vy0) * 0.8, 0.8), mGround, SX / 2, (vy0 + vy1) / 2 + (vy1 - vy0) * 0.05, zBed + 0.4, fix);
+    { const zs = zBed - bh * 0.45; add(new THREE.CylinderGeometry(9 * sc + 1, 9 * sc + 1, 50 * sc, 24), mGround, SX / 2, vy1 + 25 * sc, zs, fix);
+      add(new THREE.CylinderGeometry(14 * sc + 1, 14 * sc + 1, 18 * sc, 6), mBolt, SX / 2, vy1 + 58 * sc, zs, fix); }
+    const U = boxG(1, 1, 1), jaws = [];
+    for (const [yc, d, m] of [[-jawPl - jawBk / 2, jawBk, mVise], [-jawPl / 2, jawPl, mGround], [SY + jawPl + jawBk / 2, jawBk, mVise], [SY + jawPl / 2, jawPl, mGround]]) {
+      const o = add(U, m, SX / 2, yc, 0, fix); o.scale.set(jawW, d, 1); jaws.push(o); }
+    const bolts = []; for (const yy of [-0.2, SY + 0.2]) for (const sg of [-1, 1]) { const b = add(new THREE.CylinderGeometry(4 * sc + 1, 4 * sc + 1, 1, 16), mBolt, SX / 2 + sg * jawW * 0.3, yy, 0, fix); bolts.push(b); }
+    for (const yy of [SY * 0.22, SY * 0.78]) { const pw = Math.min(8 * sc + 2, SY * 0.18); const pr = add(U, mGround, SX / 2, yy, (zBed - 0.3) / 2, fix); pr.scale.set(Math.max(SX * 0.9, jawW * 0.9), pw, -zBed - 0.3); }
+    let curJT = 0;
+    const placeJaws = (jt) => { curJT = jt; jaws.forEach((o, k) => { const lo = k % 2 ? Math.max(zBed + 2 * sc, jt - jh) : zBed; o.scale.z = jt - lo; o.position.z = (jt + lo) / 2; }); bolts.forEach(b => { b.position.z = jt - Math.min(jh, jt - zBed) * 0.5; }); };
+    // parça ağı (parça çerçevesi), setup 2'de X ekseni etrafında çevrilir
+    const pg = new THREE.Group(); scene.add(pg);
+    const piv = new THREE.Group(); pg.add(piv); piv.position.set(-SX / 2, -SY / 2, -Hs / 2); pg.position.set(SX / 2, SY / 2, Hs / 2);
+    const baseCol = new THREE.Color(P.mat.name === 'alüminyum' ? '#d3d6da' : P.mat.col), stockCol = baseCol.clone().multiplyScalar(0.82), cutCol = baseCol.clone().multiplyScalar(1.1), PAL = [stockCol, ...P.tools.map(t => cutCol.clone().lerp(new THREE.Color(t.col), t.kind === 'face' ? 0.05 : 0.2))];
+    const geo = new THREE.BufferGeometry(); let cap = 0, pos, col;
+    const ensure = (n) => { if (n <= cap) return; cap = Math.ceil(n * 1.4); const p2 = new Float32Array(cap * 18), c2 = new Float32Array(cap * 18); if (pos) { p2.set(pos); c2.set(col); } pos = p2; col = c2;
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('color', new THREE.BufferAttribute(col, 3)); };
+    ensure(N * 3);
+    const MS = { 'alüminyum': [0.75, 0.24], 'paslanmaz': [0.82, 0.34], 'çelik': [0.82, 0.38], 'titanyum': [0.8, 0.4], 'pirinç': [0.88, 0.28], 'bakır': [0.88, 0.3], 'plastik': [0, 0.55] }[P.mat.name] || [0.78, 0.32];
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, metalness: MS[0], roughness: MS[1], flatShading: true, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geo, mat); mesh.castShadow = mesh.receiveShadow = true; piv.add(mesh);
+    let q = 0;
+    const quad = (ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, C, f = 1) => { if (q >= cap) ensure(q + 4000);
+      const o = q * 18; pos[o] = ax; pos[o + 1] = ay; pos[o + 2] = az; pos[o + 3] = bx; pos[o + 4] = by; pos[o + 5] = bz; pos[o + 6] = cx; pos[o + 7] = cy; pos[o + 8] = cz;
+      pos[o + 9] = ax; pos[o + 10] = ay; pos[o + 11] = az; pos[o + 12] = cx; pos[o + 13] = cy; pos[o + 14] = cz; pos[o + 15] = dx; pos[o + 16] = dy; pos[o + 17] = dz;
+      const r = C.r * f, g = C.g * f, bl = C.b * f; for (let k = 0; k < 18; k += 3) { col[o + k] = r; col[o + k + 1] = g; col[o + k + 2] = bl; } q++; };
+    const aoD = Math.max(3, Hs * 0.7), aoT = z => 1 - 0.34 * clamp((Hs - z) / aoD, 0, 1), aoB = z => 1 - 0.34 * clamp(z / aoD, 0, 1), aoW = z => 0.94;
+    const tri = (ax, ay, az, bx, by, bz, cx, cy, cz, C, f) => quad(ax, ay, az, bx, by, bz, cx, cy, cz, ax, ay, az, C, f);
+    // köşe yumuşatma: her hücre 4 çeyreğe ayrılır; dışbükey köşe 45° kesilir, içbükey köşe doldurulur (merdiven görüntüsünü azaltır)
+    const HT = new Float32Array(N * 4), HB = new Float32Array(N * 4), QD = [[-1, -1], [1, -1], [1, 1], [-1, 1]], E = 1e-4;
+    const nbK = (i, j) => (i < 0 || j < 0 || i >= nx || j >= ny) ? -1 : j * nx + i, sol = k => k >= 0 && st.top[k] > st.bot[k] + E;
+    const corners = () => { for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const k = j * nx + i; if (!sol(k)) continue; const t = st.top[k], b = st.bot[k];
+      for (let qi = 0; qi < 4; qi++) { const a = nbK(i + QD[qi][0], j), e = nbK(i, j + QD[qi][1]), d = nbK(i + QD[qi][0], j + QD[qi][1]), sa = sol(a), se = sol(e), sd = sol(d);
+        const ta = sa ? st.top[a] : -1e9, te = se ? st.top[e] : -1e9, td = sd ? st.top[d] : -1e9, ba = sa ? st.bot[a] : 1e9, be = se ? st.bot[e] : 1e9, bd = sd ? st.bot[d] : 1e9;
+        let ht = t, hb = b;
+        if (ta < t - E && te < t - E && td < t - E) ht = Math.max(ta, te, td); else if (ta > t + E && te > t + E && td > t + E) ht = Math.min(ta, te, td);
+        if (ba > b + E && be > b + E && bd > b + E) hb = Math.min(ba, be, bd); else if (ba < b - E && be < b - E && bd < b - E) hb = Math.max(ba, be, bd);
+        HT[k * 4 + qi] = ht; HB[k * 4 + qi] = hb; } } };
+    // kenar yarımları: [yön di, komşu (di,dj), A çeyreği, komşu çeyreği, uç noktalar (h birimi)]
+    const EDG = [[-1, 0, 0, 1, -1, -1, -1, 0], [-1, 0, 3, 2, -1, 0, -1, 1], [1, 0, 1, 0, 1, -1, 1, 0], [1, 0, 2, 3, 1, 0, 1, 1],
+                 [0, -1, 0, 3, -1, -1, 0, -1], [0, -1, 1, 2, 0, -1, 1, -1], [0, 1, 3, 0, -1, 1, 0, 1], [0, 1, 2, 1, 0, 1, 1, 1]];
+    const dwq = (ax, ay, bx, by, lo, hi, C) => { if (hi > lo + E) quad(ax, ay, lo, bx, by, lo, bx, by, hi, ax, ay, hi, C, 0.94); };
+    const half = (at, ab, nt, nb, ax, ay, bx, by, ct, cb) => { if (!(at > ab + E)) return;
+      if (!(nt > nb + E)) { quad(ax, ay, ab, bx, by, ab, bx, by, at, ax, ay, at, at >= Hs - 1e-3 && ab <= 1e-3 ? stockCol : ct, 0.94); return; }
+      if (nt < at - E) { const lo = Math.max(nt, ab); quad(ax, ay, lo, bx, by, lo, bx, by, at, ax, ay, at, ct, 0.94); }
+      if (nb > ab + E) { const hi = Math.min(nb, at); quad(ax, ay, ab, bx, by, ab, bx, by, hi, ax, ay, hi, cb, 0.94); } };
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(SX / 2, SY / 2, Hs / 2), Math.hypot(SX, SY, Hs));
+    const remesh = () => { const tm0 = performance.now(); q = 0; const h = c / 2; corners();
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const k = j * nx + i; if (!sol(k)) continue; const t = st.top[k], b = st.bot[k], o4 = k * 4;
+        const x = i * c, y = j * c, ct = PAL[CT[k]] || stockCol, cb = PAL[CT[k + N]] || stockCol;
+        let sp = false; for (let qi = 0; qi < 4; qi++) if (HT[o4 + qi] !== t || HB[o4 + qi] !== b) { sp = true; break; }
+        if (!sp) { quad(x - h, y - h, t, x + h, y - h, t, x + h, y + h, t, x - h, y + h, t, ct, aoT(t)); quad(x - h, y - h, b, x - h, y + h, b, x + h, y + h, b, x + h, y - h, b, cb, aoB(b)); }
+        else for (let qi = 0; qi < 4; qi++) { const dx = QD[qi][0] * h, dy = QD[qi][1] * h, ht = HT[o4 + qi], hb = HB[o4 + qi];
+          if (ht === t && hb === b) { quad(x, y, t, x + dx, y, t, x + dx, y + dy, t, x, y + dy, t, ct, aoT(t)); quad(x, y, b, x + dx, y, b, x + dx, y + dy, b, x, y + dy, b, cb, aoB(b)); continue; }
+          tri(x, y, t, x + dx, y, t, x, y + dy, t, ct, aoT(t)); tri(x, y, b, x + dx, y, b, x, y + dy, b, cb, aoB(b));
+          const pres = ht > hb + E;
+          if (pres) { tri(x + dx, y, ht, x + dx, y + dy, ht, x, y + dy, ht, ct, aoT(ht)); tri(x + dx, y, hb, x + dx, y + dy, hb, x, y + dy, hb, cb, aoB(hb)); }
+          const X1 = x + dx, Y1 = y + dy;
+          if (!pres) dwq(X1, y, x, Y1, b, t, ct); else { if (ht < t) dwq(X1, y, x, Y1, Math.max(ht, b), t, ct); else if (ht > t) dwq(X1, y, x, Y1, Math.max(t, hb), ht, ct); if (hb > b) dwq(X1, y, x, Y1, b, Math.min(hb, t), cb); else if (hb < b) dwq(X1, y, x, Y1, hb, Math.min(b, ht), cb); } }
+        // yan duvarlar (yarım kenar bazında; iki yarım aynıysa tek parça)
+        for (let ed = 0; ed < 8; ed += 2) { const e0 = EDG[ed], e1 = EDG[ed + 1], nk = nbK(i + e0[0], j + e0[1]), ns = sol(nk);
+          const va0 = HT[o4 + e0[2]], va1 = HB[o4 + e0[2]], va2 = ns ? HT[nk * 4 + e0[3]] : -1e9, va3 = ns ? HB[nk * 4 + e0[3]] : 1e9, vb0 = HT[o4 + e1[2]], vb1 = HB[o4 + e1[2]], vb2 = ns ? HT[nk * 4 + e1[3]] : -1e9, vb3 = ns ? HB[nk * 4 + e1[3]] : 1e9;
+          if (va0 === vb0 && va1 === vb1 && va2 === vb2 && va3 === vb3) half(va0, va1, va2, va3, x + e0[4] * h, y + e0[5] * h, x + e1[6] * h, y + e1[7] * h, ct, cb);
+          else { half(va0, va1, va2, va3, x + e0[4] * h, y + e0[5] * h, x + e0[6] * h, y + e0[7] * h, ct, cb); half(vb0, vb1, vb2, vb3, x + e1[4] * h, y + e1[5] * h, x + e1[6] * h, y + e1[7] * h, ct, cb); } } }
+      geo.setDrawRange(0, q * 6); geo.attributes.position.needsUpdate = true; geo.attributes.color.needsUpdate = true; window.__simMesh = [performance.now() - tm0, q]; };
+    // takım
+    const tool = new THREE.Group(); scene.add(tool);
+    const rot = new THREE.Group(); tool.add(rot); const hoseG = new THREE.Group(); tool.add(hoseG); const head = new THREE.Group(); tool.add(head);
+    const mHold = M(0x2c3138, 0.8, 0.3), mNut = M(0xdfe3e8, 0.95, 0.16), mHead = M(0xd6dade, 0.25, 0.42), mNose = M(0x383d45, 0.65, 0.32), mCarb = M(0xa3aab3, 0.9, 0.26), mIns = M(0xd8b552, 0.85, 0.3);
+    const cyl = (rt, rb, h, seg, mat, z, parent) => { const o = add(new THREE.CylinderGeometry(rt, rb, h, seg), mat, 0, 0, z, parent); o.rotation.x = Math.PI / 2; return o; };
+    const rf = 24 * sc + 4;                                   // BT40 flanş yarıçapı
+    cyl(rf * 1.32, rf * 1.36, 8 * sc + 1, 40, mNose, 4 * sc, head);               // burun halkası
+    cyl(rf * 1.5, rf * 1.5, 26 * sc, 40, mNose, 8 * sc + 13 * sc, head);
+    cyl(rf * 1.95, rf * 1.95, 130 * sc, 48, mHead, 34 * sc + 65 * sc, head);       // iş mili gövdesi
+    add(boxG(rf * 5, rf * 4.4, 220 * sc), mHead, 0, rf * 1.2, 34 * sc + 130 * sc + 110 * sc, head);
+    const fluteTex = (() => { const cv = document.createElement('canvas'); cv.width = 64; cv.height = 64; const g = cv.getContext('2d'); g.fillStyle = '#c9cfd6'; g.fillRect(0, 0, 64, 64);
+      g.strokeStyle = '#3b4048'; g.lineWidth = 10; for (let k = -2; k < 3; k++) { g.beginPath(); g.moveTo(k * 32, 64); g.lineTo(k * 32 + 64, 0); g.stroke(); }
+      g.strokeStyle = 'rgba(255,255,255,.55)'; g.lineWidth = 3; for (let k = -2; k < 3; k++) { g.beginPath(); g.moveTo(k * 32 + 9, 64); g.lineTo(k * 32 + 73, 0); g.stroke(); }
+      const tx = new THREE.CanvasTexture(cv); tx.wrapS = tx.wrapT = THREE.RepeatWrapping; tx.colorSpace = THREE.SRGBColorSpace; return tx; })();
+    const mHose = M(0x2f6fb0, 0.2, 0.6), mNoz = M(0xe8a23a, 0.3, 0.5);
+    let cutter = null, flute = null, NZ = [];
+    const dispose = (g) => g && g.traverse(o => { if (o.geometry && o.geometry !== U) o.geometry.dispose(); if (o.material && o.material.userData.tmp) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } });
+    const setTool = (ti) => { if (cutter) { rot.remove(cutter); dispose(cutter); } dispose(hoseG); hoseG.clear();
+      const t = P.tools[ti], r = t.d / 2, tc = new THREE.Color(t.col);
+      cutter = new THREE.Group(); rot.add(cutter);
+      const tex = fluteTex.clone(); tex.needsUpdate = true;
+      const cm = new THREE.MeshStandardMaterial({ color: new THREE.Color(0xd0d6dd).lerp(tc, 0.28), metalness: 0.85, roughness: 0.28, map: tex, emissive: tc.clone().multiplyScalar(0.06) }); cm.userData.tmp = 1;
+      const band = new THREE.MeshStandardMaterial({ color: tc, metalness: 0.3, roughness: 0.4, emissive: tc.clone().multiplyScalar(0.3) }); band.userData.tmp = 1;
+      let len = Math.max(t.d * 3, 12, (t.reach || 0) + 4 + t.d * 0.3);
+      if (t.kind === 'face') { const h = Math.max(8, r * 0.45); len = h + 4; flute = null;
+        cyl(r * 0.96, r * 0.8, h, 40, mHold, h / 2, cutter); cyl(r * 0.55, r * 0.55, 4, 32, band, h + 2, cutter);
+        const ni = Math.max(4, Math.round(r / 5)); for (let k = 0; k < ni; k++) { const a = k / ni * Math.PI * 2, s2 = Math.max(2, r * 0.16);
+          const ins = add(boxG(s2, s2 * 0.5, s2), mIns, Math.cos(a) * (r - s2 * 0.4), Math.sin(a) * (r - s2 * 0.4), s2 * 0.5, cutter); ins.rotation.z = a + Math.PI / 2; } }
+      else { tex.repeat.set(1, Math.max(1, len / Math.max(2, t.d * 1.4)));
+        if (t.kind === 'ball') { flute = add(new THREE.CapsuleGeometry(r, Math.max(0.1, len - 2 * r), 6, 20), cm, 0, 0, len / 2, cutter); flute.rotation.x = Math.PI / 2; }
+        else if (t.kind === 'spot' || t.kind === 'drill') { const tipH = r * (t.kind === 'spot' ? 1 : 0.6); flute = cyl(r, r, len - tipH, 22, cm, tipH + (len - tipH) / 2, cutter); cyl(r, 0.01, tipH, 22, cm, tipH / 2, cutter); }
+        else flute = cyl(r, r, len, 22, cm, len / 2, cutter);
+        const bh2 = Math.min(3, len * 0.12); cyl(r * 1.05, r * 1.05, bh2, 22, band, len + bh2 / 2, cutter); }
+      const rs = Math.max(r, 3), Ls = 10 + 14 * sc; cyl(rs, rs, Ls, 22, mCarb, len + Ls / 2, cutter);               // sap
+      const rn = Math.max(rs * 1.8, rs + 6 * sc + 1), hn = 7 + 10 * sc, zn = len + Ls * 0.55;
+      cyl(rn, rn, hn, 30, mNut, zn + hn / 2, cutter); cyl(rn * 0.8, rn, 1.5, 30, mNut, zn + 0.75, cutter);       // ER somunu
+      const hc = 18 + 26 * sc, rcT = Math.max(rf * 0.7, rn * 1.05); cyl(rcT, rn * 0.95, hc, 32, mHold, zn + hn + hc / 2, cutter);
+      const zf = zn + hn + hc, hf = 14 * sc + 4;
+      cyl(rf, rf, hf * 0.3, 40, mHold, zf + hf * 0.15, cutter); cyl(rf * 0.85, rf * 0.85, hf * 0.4, 40, mHold, zf + hf * 0.5, cutter); cyl(rf, rf, hf * 0.3, 40, mHold, zf + hf * 0.85, cutter);
+      const zNose = zf + hf; head.position.z = zNose;
+      // soğutma hortumları: burundan takım ucuna (iki adet, kameraya bakan yanda)
+      NZ = []; const tz = Math.max(len * 0.8, 8);
+      for (const a of [-0.15, -1.9]) { const ca = Math.cos(a), sa = Math.sin(a), rr2 = r + 5 + 7 * sc;
+        const b = [ca * rf * 1.3, sa * rf * 1.3, zNose + 4 * sc], e = [ca * rf * 1.25, sa * rf * 1.25, tz + (zNose - tz) * 0.45], tp = [ca * rr2, sa * rr2, tz + 2];
+        const m1 = hoseTo(THREE, hoseG, mHose, b, e, 2.4 * sc + 0.8), m2 = hoseTo(THREE, hoseG, mHose, e, [tp[0] + (e[0] - tp[0]) * 0.22, tp[1] + (e[1] - tp[1]) * 0.22, tp[2] + (e[2] - tp[2]) * 0.22], 2.1 * sc + 0.7);
+        hoseTo(THREE, hoseG, mNoz, [tp[0] + (e[0] - tp[0]) * 0.22, tp[1] + (e[1] - tp[1]) * 0.22, tp[2] + (e[2] - tp[2]) * 0.22], tp, 1.6 * sc + 0.6); NZ.push(tp); } };
+    // talaş parçacıkları
+    // soğutma sıvısı hortumları (iş miline bağlı) + talaş / sıvı parçacıkları
+    const onJaw = (x, y) => x > SX / 2 - jawW / 2 && x < SX / 2 + jawW / 2 && ((y < 0 && y > -jawPl - jawBk) || (y > SY && y < SY + jawPl + jawBk));
+    const floorAt = (x, y) => (x > 0 && x < SX && y > 0 && y < SY) ? Hs : onJaw(x, y) ? curJT : (x > vx0 && x < vx1 && y > vy0 && y < vy1) ? zBed : (Math.abs(x - SX / 2) < tL / 2 && Math.abs(y - SY / 2) < tW / 2) ? zT : zT - tTh - 140 * sc;
+    const fx = makeFX(scene, span, P.mat.col, floorAt);
+    let cutLive = 0; const emit = (x, y, z) => { cutLive = 0.25; fx.chips(x, y, z, 2); };
+    const nzW = () => NZ.map(n => new THREE.Vector3(toolPos.x + n[0], toolPos.y + n[1], toolPos.z + n[2]));
+    // zaman çizelgesi
+    const RAPID = 6000; const tl = []; let T0 = 0;
+    P.setups.forEach((S, si) => { let prev = [SX / 2, SY / 2, Hs + 30];
+      tl.push({ flip: si, t0: T0, t1: T0 + (si ? 2.5 : 0) }); T0 += si ? 2.5 : 0;
+      for (const m of S.moves) { const d = Math.hypot(m[0] - prev[0], m[1] - prev[1], m[2] - prev[2]); const f = m[3] > 0 ? m[3] : RAPID; const dt = d / f * 60; tl.push({ a: prev, b: [m[0], m[1], m[2]], cut: m[3] > 0, tool: m[4], s: si, t0: T0, t1: T0 + dt }); T0 += dt; prev = [m[0], m[1], m[2]]; } });
+    const total = T0;
+    const opsFlat = []; P.setups.forEach((S, si) => S.ops.forEach(o => opsFlat.push({ ...o, s: si, idx: 0 })));
+    // op başlangıç zamanları
+    { let k = 0; P.setups.forEach((S, si) => { let mi = 0; for (const e of tl) { if (e.s !== si || e.flip !== undefined) continue; } }); }
+    const opAt = []; { let mvIdx = 0; P.setups.forEach((S, si) => { let m = 0; for (const e of tl) { if (e.flip !== undefined || e.s !== si) continue; for (const o of S.ops) if (o.at === m) opAt.push({ t: e.t0, name: o.name, tool: o.tool, s: si }); m++; } }); }
+    let curSetup = -1, curToolIdx = -1, ei = 0, simT = 0, lastP = null, dirtyFlag = true;
+    const setSetup = (si, animate) => { curSetup = si; const S = P.setups[si]; placeJaws(S.jawTop); pg.rotation.x = si ? Math.PI : 0; };
+    setSetup(0);
+    const toolPos = new THREE.Vector3(SX / 2, SY / 2, Hs + 40);
+    const advance = (to, live) => { // zamanı ilerlet, malzemeyi kes
+      while (ei < tl.length && tl[ei].t1 <= to) { const e = tl[ei];
+        if (e.flip !== undefined) { if (e.flip !== curSetup) setSetup(e.flip); }
+        else { if (e.tool !== curToolIdx) { curToolIdx = e.tool; if (live) setTool(e.tool); }
+          if (e.cut) { const from = lastP && lastP.e === ei ? lastP.p : e.a; if (stampPlan(st, nx, ny, c, from, e.b, P.tools[e.tool], e.s, Hs, CT, e.tool + 1)) dirtyFlag = true; }
+          toolPos.set(e.b[0], e.b[1], e.b[2]); }
+        ei++; lastP = null; }
+      if (ei < tl.length) { const e = tl[ei]; if (to >= e.t0) {
+        if (e.flip !== undefined) { if (curSetup !== e.flip) { const u = (to - e.t0) / (e.t1 - e.t0); pg.rotation.x = Math.PI * clamp(u, 0, 1); if (u >= 1) setSetup(e.flip); } }
+        else { if (e.tool !== curToolIdx) { curToolIdx = e.tool; if (live) setTool(e.tool); }
+          const u = clamp((to - e.t0) / Math.max(1e-9, e.t1 - e.t0), 0, 1), p = [e.a[0] + (e.b[0] - e.a[0]) * u, e.a[1] + (e.b[1] - e.a[1]) * u, e.a[2] + (e.b[2] - e.a[2]) * u];
+          if (e.cut) { const from = lastP && lastP.e === ei ? lastP.p : e.a; if (stampPlan(st, nx, ny, c, from, p, P.tools[e.tool], e.s, Hs, CT, e.tool + 1)) { dirtyFlag = true; if (live) emit(p[0], p[1], p[2]); } lastP = { e: ei, p }; }
+          toolPos.set(p[0], p[1], p[2]); } } }
+      simT = to; };
+    const restart = () => { reset(); ei = 0; simT = 0; lastP = null; curToolIdx = -1; pg.position.z = Hs / 2; pg.rotation.z = 0; tool.visible = true; setSetup(0); dirtyFlag = true; };
+    const center = new THREE.Vector3(SX / 2, SY / 2, Hs / 2);
+    fit(center.x, center.y, center.z, Math.max(SX, SY) * 1.3 + Hs, 0.7, -1, 1.15); controls.maxDistance = span * 6; controls.minDistance = span * 0.25;
+    sun.position.set(center.x - span, center.y - span * 1.4, span * 2.5); sun.target.position.copy(center);
+    Object.assign(sun.shadow.camera, { left: -span * 1.5, right: span * 1.5, top: span * 1.5, bottom: -span * 1.5, near: 1, far: span * 8 }); sun.shadow.camera.updateProjectionMatrix();
+    fill.position.set(center.x + span, center.y + span, span);
+    let lastMesh = 0;
+    return {
+      total, ops: opAt, tools: P.tools, setups: P.setups.length, info: { real: tg.real, cell: c, Dr: P.tools[0] && P.tools[0].d },
+      seek(t) { if (t < simT) restart(); advance(t, false); if (curToolIdx >= 0) setTool(curToolIdx); remesh(); dirtyFlag = false; },
+      fx, tick(t, dt, now) { advance(t, true); tool.position.copy(toolPos); rot.rotation.z += dt * 40; cutLive -= dt;
+        fx.step(dt, nzW(), new THREE.Vector3(toolPos.x, toolPos.y, toolPos.z + span * 0.015), true);
+        if (dirtyFlag && now - lastMesh > Math.max(70, (window.__simMesh ? window.__simMesh[0] : 10) * 3)) { remesh(); dirtyFlag = false; lastMesh = now; } },
+      reset() { restart(); remesh(); },
+      finish() { remesh(); dirtyFlag = false; this._r0 = pg.rotation.x; this._z0 = toolPos.z; },
+      present(u, dt) { const e1 = clamp(u / 0.35, 0, 1), s1 = e1 * e1 * (3 - 2 * e1), e2 = clamp((u - 0.25) / 0.75, 0, 1);
+        toolPos.z = this._z0 + (Hs + 60 * sc + 40 - this._z0) * s1; tool.position.copy(toolPos); rot.rotation.z += dt * 40 * (1 - s1);
+        pg.position.z = Hs / 2 + (Hs * 0.9 + 25 * sc + 8) * s1; pg.rotation.x = (this._r0 || 0) * (1 - s1); pg.rotation.z = Math.PI * 2 * e2 * e2 * 0.5;
+        fx.step(dt, nzW(), new THREE.Vector3(toolPos.x, toolPos.y, toolPos.z), false); },
+      setupAt(t) { let s = 0; for (const e of tl) { if (e.flip !== undefined && e.t0 <= t) s = e.flip; } return s; }
+    };
+  }
+
+  // ---------------------------------------------------------------- torna sahnesi
+  async function buildLathe() {
+    const tp = procLathe(job), P = planLathe(tp, job);
+    const { Rst } = P, N = tp.N, Ls = tp.L + P.face + 4;   // stok uzunluğu (aynadan dışarı)
+    const span = Math.max(tp.L * 1.3, Rst * 4);
+    // sahne ekseni: torna ekseni = X (ayna solda, x<0), yukarı Z
+    const ax = new THREE.Group(); scene.add(ax);
+    // tezgâh gövdesi, ayna
+    add(boxG(span * 4, span * 1.6, span * 0.1), mDark, span * 0.6, span * 0.2, -Math.max((Rst * 1.35 + 8) * 1.6, span * 0.5), ax);
+    const chuck = new THREE.Group(); ax.add(chuck);
+    const chR = Rst * 1.35 + 8;
+    const chL = Math.max(14, chR * 0.55); const body = add(new THREE.CylinderGeometry(chR, chR, chL, 40), mSteel, -chL / 2 - 4 - chR * 0.18, 0, 0, chuck); body.rotation.z = Math.PI / 2;
+    for (let k = 0; k < 3; k++) { const jw = add(boxG(chR * 0.36, chR * 0.3, chR * 0.42), mDark, 0, 0, 0, chuck); const a = k * Math.PI * 2 / 3 + 0.5; jw.position.set(-4 - chR * 0.18 + 0.5, Math.cos(a) * (Rst + chR * 0.21), Math.sin(a) * (Rst + chR * 0.21)); jw.rotation.x = a; }
+    const head = add(boxG(chR * 1.6, chR * 3, chR * 2.6), mBody, -4 - chR * 0.18 - chL - chR * 0.8, 0, -chR * 0.3, ax);
+    // iş parçası (dönen)
+    const spin = new THREE.Group(); ax.add(spin); spin.position.x = -4;
+    const ro = new Float32Array(N + 8), ri = new Float32Array(N + 8), cO = new Uint8Array(N + 8), cI = new Uint8Array(N + 8);
+    // stok örnekleme: z = -4 .. L+face; hücre: tp.dz
+    const z0 = -4, NS = Math.ceil((tp.L + P.face - z0) / tp.dz) + 1, dz = tp.dz;
+    const RO = new Float32Array(NS), RI = new Float32Array(NS), CO = new Uint8Array(NS), CIn = new Uint8Array(NS);
+    const reset = () => { RO.fill(Rst); RI.fill(0); CO.fill(0); CIn.fill(0); feats.clear(); };
+    const feats = new Set();
+    const stockCol = new THREE.Color(P.mat.col), PAL = [stockCol, ...P.tools.map(t => new THREE.Color(t.col).lerp(stockCol, 0.5))];
+    const SEG = 48, geo = new THREE.BufferGeometry();
+    const vpos = new Float32Array((NS * 2 + 4) * (SEG + 1) * 3), vcol = new Float32Array(vpos.length);
+    geo.setAttribute('position', new THREE.BufferAttribute(vpos, 3)); geo.setAttribute('color', new THREE.BufferAttribute(vcol, 3));
+    const idx = []; const rings = NS * 2 + 2;
+    for (let r = 0; r < rings - 1; r++) for (let s = 0; s < SEG; s++) { const a = r * (SEG + 1) + s, b = a + SEG + 1; idx.push(a, b, a + 1, a + 1, b, b + 1); }
+    geo.setIndex(idx);
+    const wmat = new THREE.MeshStandardMaterial({ vertexColors: true, metalness: 0.4, roughness: 0.34, side: THREE.DoubleSide });
+    const wp = new THREE.Mesh(geo, wmat); wp.castShadow = true; spin.add(wp);
+    const rAt = (k, th, outer) => { let r = outer ? RO[k] : RI[k]; if (!outer) return r; const zz = z0 + k * dz; const f = tp.feat;
+      if (feats.has('hex') && f.hex && zz >= f.hex.z0 && zz <= f.hex.z1) { const a = ((th % (Math.PI / 3)) + Math.PI / 3) % (Math.PI / 3) - Math.PI / 6; r = Math.min(r, f.hex.s / 2 / Math.cos(a)); }
+      if (feats.has('flats') && f.flats && zz >= f.flats.z0 && zz <= f.flats.z1) { const cs = Math.abs(Math.cos(th)); if (cs > 1e-3) r = Math.min(r, f.flats.s / 2 / cs); }
+      if (feats.has('keyway') && f.keyway && zz >= f.keyway.z0 && zz <= f.keyway.z1) { const yy = Math.abs(Math.sin(th) * r); if (yy < f.keyway.w / 2 && Math.cos(th) > 0) r = Math.min(r, r - f.keyway.d); }
+      if (feats.has('ecc') && f.ecc && zz >= f.ecc.z0 && zz <= f.ecc.z1) { const e = f.ecc.e, R = f.ecc.r; r = Math.min(r, e * Math.cos(th) + Math.sqrt(Math.max(0, R * R - e * e * Math.sin(th) ** 2))); }
+      if (f.thread && zz >= f.thread.z0 && zz <= f.thread.z1 && CO[k] && P.tools[CO[k] - 1] && P.tools[CO[k] - 1].name.startsWith('Diş')) { const ph = ((zz / f.thread.p) % 1 + 1) % 1; r -= Math.abs(ph - 0.5) * f.thread.p * 0.55; }
+      return r; };
+    const remesh = () => { let v = 0; const put = (x, r, th, C) => { vpos[v * 3] = x; vpos[v * 3 + 1] = Math.cos(th) * r; vpos[v * 3 + 2] = Math.sin(th) * r; const sh = 0.93 + 0.07 * Math.cos(th * 6); vcol[v * 3] = C.r * sh; vcol[v * 3 + 1] = C.g * sh; vcol[v * 3 + 2] = C.b * sh; v++; };
+      // dış yüzey soldan sağa, sonra alın, iç yüzey sağdan sola
+      let kmax = NS - 1; while (kmax > 0 && RO[kmax] <= RI[kmax] + 1e-3) kmax--;
+      for (let k = 0; k < NS; k++) { const kk = Math.min(k, kmax); for (let s = 0; s <= SEG; s++) { const th = s / SEG * Math.PI * 2; put(z0 + k * dz, Math.max(rAt(kk, th, true), RI[kk]), th, PAL[CO[kk]] || stockCol); } }
+      for (let s = 0; s <= SEG; s++) { const th = s / SEG * Math.PI * 2; put(z0 + kmax * dz, RI[kmax], th, PAL[CO[kmax]] || stockCol); }
+      for (let s = 0; s <= SEG; s++) { const th = s / SEG * Math.PI * 2; put(z0 + kmax * dz, RI[kmax], th, PAL[CIn[kmax]] || stockCol); }
+      for (let k = NS - 1; k >= 0; k--) { const kk = Math.min(k, kmax); for (let s = 0; s <= SEG; s++) { const th = s / SEG * Math.PI * 2; put(z0 + k * dz, RI[kk], th, PAL[CIn[kk]] || stockCol); } }
+      geo.attributes.position.needsUpdate = true; geo.attributes.color.needsUpdate = true; geo.computeVertexNormals(); geo.computeBoundingSphere(); };
+    // delik görselleri (bitince görünür)
+    const holeGrp = new THREE.Group(); spin.add(holeGrp); const holeMat = M(0x16191e, 0.2, 0.8);
+    const buildHoles = () => { holeGrp.clear(); const f = tp.feat;
+      if (feats.has('holesAx') && f.holesAx) for (let k = 0; k < f.holesAx.n; k++) { const a = k / f.holesAx.n * Math.PI * 2, h = add(new THREE.CylinderGeometry(f.holesAx.d / 2, f.holesAx.d / 2, f.holesAx.z1 - f.holesAx.z0 + 0.6, 16), holeMat, (f.holesAx.z0 + f.holesAx.z1) / 2, Math.cos(a) * f.holesAx.pcd / 2, Math.sin(a) * f.holesAx.pcd / 2, holeGrp); h.rotation.z = Math.PI / 2; }
+      if (feats.has('holesRad') && f.holesRad) for (let k = 0; k < f.holesRad.n; k++) { const a = k / f.holesRad.n * Math.PI * 2, k2 = Math.round((f.holesRad.z - z0) / dz), R = RO[k2] || tp.D / 2; const h = add(new THREE.CylinderGeometry(f.holesRad.d / 2, f.holesRad.d / 2, R * 2 + 0.4, 16), holeMat, f.holesRad.z, 0, 0, holeGrp); h.rotation.x = a; }
+      if (feats.has('angled') && f.angled) for (let k = 0; k < f.angled.n; k++) { const a = k / f.angled.n * Math.PI * 2, zc = tp.L * (0.4 + 0.35 * (k % 2)); const h = add(new THREE.CylinderGeometry(f.angled.d / 2, f.angled.d / 2, tp.D * 0.9, 16), holeMat, zc, 0, 0, holeGrp); h.rotation.set(a, 0, 0.6); }
+    };
+    // takım tutucu (uç orijinde)
+    const insert = new THREE.Group(); ax.add(insert);
+    let tipMesh = null;
+    const setTool = (ti) => { if (tipMesh) insert.remove(tipMesh); const t = P.tools[ti]; const cm = new THREE.MeshStandardMaterial({ color: t.col, metalness: 0.5, roughness: 0.35, emissive: new THREE.Color(t.col).multiplyScalar(0.18) });
+      tipMesh = new THREE.Group(); insert.add(tipMesh); const sl = Math.max(30, Rst * 1.4), bw = Math.max(8, Rst * 0.35);
+      if (t.kind === 'drill' || t.kind === 'id') { const r = t.kind === 'drill' ? Math.min(t.w || 8, 32) / 2 : Math.max(2, Math.min(Rst * 0.3, 12)); const g = add(new THREE.CylinderGeometry(r, r, sl * 1.6, 18), cm, sl * 0.8, 0, 0, tipMesh); g.rotation.z = Math.PI / 2;
+        add(boxG(sl * 0.5, bw * 1.6, bw * 1.6), mBody, sl * 1.6 + sl * 0.25, 0, 0, tipMesh); }
+      else if (t.kind === 'live') { const r = Math.max(2, Math.min(Rst * 0.18, 8)); const g = add(new THREE.CylinderGeometry(r, r, sl * 0.6, 16), cm, 0, 0, sl * 0.3, tipMesh); g.rotation.x = Math.PI / 2;
+        const hd = add(new THREE.CylinderGeometry(bw, bw, sl * 0.5, 20), mBody, 0, 0, sl * 0.85, tipMesh); hd.rotation.x = Math.PI / 2; }
+      else { const w = t.kind === 'groove' || t.kind === 'part' ? (t.w || 2) : Math.max(4, Math.min(Rst * 0.3, 10));
+        add(boxG(w, sl, w * 0.9), cm, 0, -sl / 2 - w * 0.35, 0, tipMesh);
+        add(boxG(bw * 1.2, sl * 0.6, bw * 1.4), mBody, 0, -sl - sl * 0.3, 0, tipMesh);
+        if (t.kind === 'od' || t.kind === 'thread') { const tc = add(new THREE.ConeGeometry(w * 0.55, w * 0.9, 4), cm, 0, -w * 0.3, 0, tipMesh); } } };
+    // zaman çizelgesi
+    const RAPID = 5000; const tl = []; let T0 = 0, prev = [Rst + 30, tp.L + 30];
+    for (const m of P.moves) { const d = Math.hypot(m[0] - prev[0], m[1] - prev[1]); const kind = m[4] || 'od';
+      const dt = kind.startsWith('live') ? 6 : d / (m[2] > 0 ? m[2] : RAPID) * 60; tl.push({ a: prev, b: [m[0], m[1]], cut: m[2] > 0, tool: m[3], kind, t0: T0, t1: T0 + dt }); T0 += dt; prev = [m[0], m[1]]; }
+    const total = T0; const opAt = []; { let m = 0; for (const e of tl) { for (const o of P.ops) if (o.at === m) opAt.push({ t: e.t0, name: o.name, tool: o.tool, s: 0 }); m++; } }
+    let ei = 0, simT = 0, curTool = -1, dirtyFlag = true, partOff = 0, cutNow = false;
+    const bedTop = -Math.max((Rst * 1.35 + 8) * 1.6, span * 0.5) + span * 0.05;
+    const fx = makeFX(scene, span, P.mat.col, (x, y) => bedTop);
+    const mHose = M(0x2f6fb0, 0.2, 0.6), mNoz = M(0xe8a23a, 0.3, 0.5); const nzOff = [-span * 0.05, -span * 0.06, Rst + span * 0.16];
+    hoseTo(THREE, insert, mHose, [nzOff[0] - span * 0.05, nzOff[1] - span * 0.25, nzOff[2] + span * 0.1], [nzOff[0], nzOff[1] - span * 0.02, nzOff[2] + span * 0.03], span * 0.012);
+    hoseTo(THREE, insert, mNoz, [nzOff[0], nzOff[1] - span * 0.02, nzOff[2] + span * 0.03], nzOff, span * 0.009);
+    const tipPos = new THREE.Vector2(Rst + 30, tp.L + 30);
+    const kOf = z => Math.round((z - z0) / dz);
+    const cutTo = (x, z, e) => { const t = P.tools[e.tool]; const k = kOf(z); const ci = e.tool + 1;
+      if (e.kind === 'drill') { const r = Math.min(t.w || 8, 32) / 2; for (let kk = Math.max(0, k); kk < NS; kk++) if (RI[kk] < r) { RI[kk] = Math.min(r, RO[kk]); CIn[kk] = ci; dirtyFlag = true; } return; }
+      if (e.kind === 'id') { for (let kk = Math.max(0, k); kk < NS; kk++) if (RI[kk] < x) { RI[kk] = Math.min(x, RO[kk]); CIn[kk] = ci; dirtyFlag = true; } return; }
+      if (e.kind === 'part') { const w = Math.ceil(3 / dz / 2); for (let kk = k - w; kk <= k + w; kk++) if (kk >= 0 && kk < NS && RO[kk] > x) { RO[kk] = Math.max(x, RI[kk]); CO[kk] = ci; dirtyFlag = true; } return; }
+      const w = t.kind === 'groove' ? Math.ceil(1 / dz) : 1;
+      // alın: x değişirken z sabit -> z'nin sağındaki her şey
+      if (Math.abs(e.b[1] - e.a[1]) < 1e-6 && Math.abs(e.b[0] - e.a[0]) > 1e-6 && t.kind === 'od' && e.cut && e.b[1] >= tp.L - 1e-3) { for (let kk = kOf(e.b[1]) + 1; kk < NS; kk++) if (RO[kk] > Math.max(x, 0)) { RO[kk] = Math.max(x, 0); CO[kk] = ci; dirtyFlag = true; } }
+      for (let kk = k - w; kk <= k + w; kk++) if (kk >= 0 && kk < NS && RO[kk] > x + 1e-4 && x >= 0) { RO[kk] = Math.max(x, RI[kk]); CO[kk] = ci; dirtyFlag = true; } };
+    const advance = (to, live) => {
+      while (ei < tl.length && tl[ei].t1 <= to) { const e = tl[ei]; if (e.tool !== curTool) { curTool = e.tool; if (live) setTool(curTool); }
+        if (e.cut) { if (e.kind.startsWith('live')) { feats.add(e.kind.slice(5)); dirtyFlag = true; if (live) buildHoles(); }
+          else { const n = Math.max(1, Math.ceil(Math.hypot(e.b[0] - e.a[0], e.b[1] - e.a[1]) / (dz * 0.8))); for (let s = 1; s <= n; s++) cutTo(e.a[0] + (e.b[0] - e.a[0]) * s / n, e.a[1] + (e.b[1] - e.a[1]) * s / n, e); } }
+        tipPos.set(e.b[0], e.b[1]); ei++; }
+      if (ei < tl.length && to >= tl[ei].t0) { const e = tl[ei]; if (e.tool !== curTool) { curTool = e.tool; if (live) setTool(curTool); }
+        const u = clamp((to - e.t0) / Math.max(1e-9, e.t1 - e.t0), 0, 1), x = e.a[0] + (e.b[0] - e.a[0]) * u, z = e.a[1] + (e.b[1] - e.a[1]) * u;
+        if (e.cut && !e.kind.startsWith('live')) { const n = Math.max(1, Math.ceil(Math.hypot(x - e.a[0], z - e.a[1]) / (dz * 0.8))); for (let s = 1; s <= n; s++) cutTo(e.a[0] + (x - e.a[0]) * s / n, e.a[1] + (z - e.a[1]) * s / n, e); if (live) cutNow = true; }
+        tipPos.set(x, z); }
+      simT = to; };
+    const restart = () => { reset(); ei = 0; simT = 0; curTool = -1; holeGrp.clear(); dirtyFlag = true; };
+    reset();
+    fit(tp.L * 0.42 - 4, 0, 0, Math.max(tp.L * 1.3 + 10, Rst * 3.2), 0.3, -1, 0.5); controls.maxDistance = span * 6; controls.minDistance = span * 0.2;
+    sun.position.set(-span, -span * 1.5, span * 2.5); sun.target.position.set(tp.L / 2, 0, 0);
+    Object.assign(sun.shadow.camera, { left: -span * 2, right: span * 2, top: span * 2, bottom: -span * 2, near: 1, far: span * 8 }); sun.shadow.camera.updateProjectionMatrix();
+    fill.position.set(span, span, span);
+    let lastMesh = 0, ang = 0;
+    return { fx, total, ops: opAt, tools: P.tools, setups: 1, info: {},
+      seek(t) { if (t < simT) restart(); advance(t, false); if (curTool >= 0) setTool(curTool); buildHoles(); remesh(); dirtyFlag = false; },
+      tick(t, dt, now) { advance(t, true); const e = tl[Math.min(ei, tl.length - 1)];
+        const liveOp = e && e.kind.startsWith('live') && t >= e.t0;
+        ang += dt * (liveOp ? 0.6 : 18); spin.rotation.x = ang;
+        const x = tipPos.x, z = tipPos.y, axial = e && (e.kind === 'drill' || e.kind === 'id');
+        if (liveOp) insert.position.set(z - 4 + Math.sin(t * 2) * tp.L * 0.15, 0, Rst + 1 + Math.abs(Math.sin(t * 5)) * 2);
+        else if (axial) insert.position.set(z - 4, 0, 0);
+        else insert.position.set(z - 4, -x, 0);
+        { const ip = insert.position, tip = new THREE.Vector3(ip.x, ip.y, ip.z + 0.5);
+          if (cutNow && dt > 0) { const vt = span * 0.9; fx.chips(tip.x, tip.y, tip.z, axial ? 1 : 3, (Math.random() - 0.3) * span * 0.3, -vt * 0.4, -vt * 0.6); cutNow = false; }
+          fx.step(dt, [new THREE.Vector3(ip.x + nzOff[0], ip.y + nzOff[1], ip.z + nzOff[2])], tip, true); }
+        if (dirtyFlag && now - lastMesh > 60) { remesh(); dirtyFlag = false; lastMesh = now; } },
+      finish() { remesh(); dirtyFlag = false; this._ip = insert.position.clone(); },
+      present(u, dt) { const e1 = clamp(u / 0.35, 0, 1), s1 = e1 * e1 * (3 - 2 * e1); ang += dt * 18 * (1 - s1) + dt * 1.2; spin.rotation.x = ang;
+        if (this._ip) insert.position.set(this._ip.x + 25 * s1, this._ip.y - (Rst + 30) * s1, this._ip.z); fx.step(dt, [], new THREE.Vector3(), false); },
+      reset() { restart(); remesh(); }, setupAt() { return 0; } };
+  }
+
+  // ---------------------------------------------------------------- gerçek NC programı (zaman damgalı voksel)
+  async function buildNC() {
+    const D = await loadNC(spec.nc);
+    const mi = matInfo(job.mat);
+    { const pm = new THREE.PMREMGenerator(renderer), es = new THREE.Scene();
+      es.add(new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial({ color: 0x45474a, side: THREE.BackSide })));
+      const lamp = (x, y, z, w, d, h, i) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, d, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(i, i, i) })); o.position.set(x, y, z); es.add(o); };
+      lamp(0, 0.8, 4.8, 7, 1.4, 0.1, 9); lamp(-4.8, -1, 1.6, 0.1, 4, 1.2, 2.6); lamp(4.8, 1.5, 2.2, 0.1, 3, 1.2, 2); lamp(0, -4.8, 2.4, 6, 0.1, 1.2, 1.6); lamp(0, 0, -4.8, 9, 9, 0.1, 0.18);
+      scene.environment = pm.fromScene(es, 0.035).texture; pm.dispose(); }
+    scene.traverse(o => { if (o.isHemisphereLight) { o.intensity = 0.45; o.color.set(0xffffff); o.groundColor.set(0x2b2b2b); } if (o.isDirectionalLight && o !== sun) o.color.set(0xdfe6ee); });
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.15;
+    scene.background = new THREE.Color(0x101318);
+    const mVise = M(0x4b5159, 0.4, 0.45), mGround = M(0xc5cbd2, 0.95, 0.2), mTable = M(0x6c737c, 0.65, 0.48), mSlot = M(0x23272d, 0.4, 0.75), mWall = M(0x8d939b, 0.45, 0.5), mBolt = M(0x1c1f24, 0.7, 0.35), mBlue = M(0x2d5d8f, 0.35, 0.45);
+    const span = 80;
+    const tools = D.tools.map(t => ({ ...t, cd: `S ${t.S || '—'} dev/dk · F ${t.F || '—'} mm/dk · gerçek programdan` }));
+    // ---- zaman çizelgesi (bağlama + program, op op)
+    let T0 = 0; const opsT = [];
+    D.ops.forEach((op, k) => { op.T0 = T0; op.Tp = T0 + op.load; op.T1 = op.Tp + op.dur; T0 = op.T1; opsT.push(op); });
+    const total = T0;
+    const LOADINFO = ['Ham lama (50×10×35) 3 eksen mengeneye 3 mm’den bağlanıyor. Sıfır: stok merkezi, kaba üst yüzeyin 0,3 mm altı.',
+      'Parça ters çevrilip açılan mengene ağzından 5 eksen tezgâhın mengenesine bağlanıyor. Tabla dönse de tek sıfır kullanılıyor.',
+      'Parça tekrar çevrilip 3 eksen mengeneye bağlanıyor. Bu bağlamada mengene ağzı kaldırılıp alt yüz bitirilecek.'];
+    const opAt = [];
+    opsT.forEach((op, k) => {
+      opAt.push({ t: op.T0, name: `${op.title} · ${op.mach} · bağlama`, info: LOADINFO[k] || '', tool: Math.max(0, (op.subs[0] || { tool: 1 }).tool - 1), s: k });
+      op.subs.forEach(sb => { const tl = tools[sb.tool - 1];
+        const ori = op.axes === 5 ? (sb.B ? ` · tabla B${Math.round(sb.B)}° C${Math.round(sb.C)}°` : ' · tabla B0° C0°') : '';
+        opAt.push({ t: op.Tp + sb.t, name: `${op.title} · ${tl.name}`, info: `${tl.what}${ori}${sb.B ? ' — parça yana yatırıldı, takım yandan çalışıyor.' : '.'}`, tool: sb.tool - 1, s: k }); }); });
+    opAt.sort((a, b) => a.t - b.t);
+    // ---- voksel malzeme (raymarch)
+    const base = new THREE.Color(mi.col), colStock = base.clone().multiplyScalar(0.55), colCut = base.clone().multiplyScalar(1.0);
+    const tcol = []; for (let i = 0; i < 32; i++) tcol.push(i && tools[i - 1] ? new THREE.Color(tools[i - 1].col) : new THREE.Color(0, 0, 0));
+    const U = { vox: { value: null }, lo: { value: new THREE.Vector3() }, hh: { value: 0.25 }, N: { value: new THREE.Vector3() }, tq: { value: 0 },
+      camO: { value: new THREE.Vector3() }, uMVP: { value: new THREE.Matrix4() }, uModel: { value: new THREE.Matrix4() }, nmat: { value: new THREE.Matrix3() },
+      colStock: { value: colStock }, colCut: { value: colCut }, tcol: { value: tcol }, Ls: { value: new THREE.Vector3(-0.4, -0.55, 0.73).normalize() }, Lf: { value: new THREE.Vector3(0.6, 0.6, 0.5).normalize() }, dbg: { value: 0 } }; window.__ncU = U;
+    const vmat = new THREE.ShaderMaterial({ uniforms: U, side: THREE.BackSide,
+      vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `precision highp float; precision highp int; precision highp usampler3D;
+uniform usampler3D vox; uniform vec3 lo; uniform float hh; uniform vec3 N; uniform uint tq;
+uniform vec3 camO; uniform mat4 uMVP; uniform mat4 uModel; uniform mat3 nmat;
+uniform vec3 colStock; uniform vec3 colCut; uniform vec3 tcol[32]; uniform vec3 Ls; uniform vec3 Lf; uniform float dbg;
+varying vec3 vP;
+float occ(ivec3 c, ivec3 n){ if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, n))) return 0.0; return texelFetch(vox, c, 0).r > tq ? 1.0 : 0.0; }
+void main(){
+  ivec3 n = ivec3(N + 0.5);
+  vec3 ro = camO, rd = normalize(vP - camO);
+  rd = sign(rd) * max(abs(rd), vec3(1e-6)); rd = normalize(rd);
+  vec3 inv = 1.0 / rd, bmin = lo, bmax = lo + N * hh;
+  vec3 t0 = (bmin - ro) * inv, t1 = (bmax - ro) * inv, tn = min(t0, t1), tf = max(t0, t1);
+  float tN = max(max(tn.x, tn.y), max(tn.z, 0.0)), tF = min(min(tf.x, tf.y), tf.z);
+  if (tN >= tF) discard;
+  vec3 p = (ro + rd * (tN + 1e-4) - lo) / hh;
+  ivec3 c = clamp(ivec3(floor(p)), ivec3(0), n - 1);
+  ivec3 st = ivec3(sign(rd));
+  vec3 tD = abs(hh * inv);
+  vec3 nb = lo + (vec3(c) + max(vec3(st), 0.0)) * hh;
+  vec3 tM = (nb - ro) * inv;
+  int ax = 2; float tH = tN; bool hit = false;
+  for (int i = 0; i < 700; i++) {
+    if (texelFetch(vox, c, 0).r > tq) { hit = true; break; }
+    if (tM.x < tM.y && tM.x < tM.z) { tH = tM.x; tM.x += tD.x; c.x += st.x; ax = 0; }
+    else if (tM.y < tM.z) { tH = tM.y; tM.y += tD.y; c.y += st.y; ax = 1; }
+    else { tH = tM.z; tM.z += tD.z; c.z += st.z; ax = 2; }
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, n))) break;
+  }
+  if (!hit) discard;
+  vec3 fn = vec3(0.0); fn[ax] = -float(st[ax]);
+  vec3 g = vec3(0.0); float os = 0.0;
+  for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+    ivec3 o = ivec3(dx, dy, dz); if (o == ivec3(0)) continue;
+    float w = 1.0 / float(dx * dx + dy * dy + dz * dz), q = occ(c + o, n);
+    g += q * vec3(o) * w; os += q; }
+  float ao = clamp(1.0 - (os / 26.0 - 0.654) * 1.7, 0.62, 1.18);
+  vec3 nrm = length(g) > 0.35 ? -normalize(g) : fn;
+  if (dot(nrm, fn) < 0.2) nrm = normalize(nrm + fn * 1.2);
+  ivec3 pc = c; pc[ax] -= st[ax];
+  vec3 col = colStock; float met = 0.0;
+  if (all(greaterThanEqual(pc, ivec3(0))) && all(lessThan(pc, n))) { uvec2 v = texelFetch(vox, pc, 0).rg; if (v.g > 0u) { col = mix(colCut, tcol[int(v.g)], 0.3); met = 1.0; } }
+  vec3 hp = ro + rd * tH;
+  vec4 wp = uModel * vec4(hp, 1.0);
+  vec3 nw = normalize(nmat * nrm), V = normalize(cameraPosition - wp.xyz);
+  float dif = max(dot(nw, Ls), 0.0) + max(dot(nw, Lf), 0.0) * 0.3;
+  float hemi = 0.5 + 0.5 * nw.z;
+  vec3 Hv = normalize(Ls + V); float sp = pow(max(dot(nw, Hv), 0.0), mix(14.0, 40.0, met)) * mix(0.06, 0.32, met);
+  float fr = pow(1.0 - max(dot(nw, V), 0.0), 4.0);
+  vec3 cc = (col * (0.11 + 0.13 * hemi + dif * 0.4) + vec3(sp) + fr * mix(0.03, 0.1, met) * vec3(0.85, 0.9, 0.97)) * ao;
+  gl_FragColor = vec4(cc, 1.0);
+  if (dbg > 0.5) gl_FragColor = vec4(dbg > 1.5 ? col : nw * 0.5 + 0.5, 1.0);
+  vec4 cl = uMVP * vec4(hp, 1.0); gl_FragDepth = clamp(cl.z / cl.w * 0.5 + 0.5, 0.0, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}` });
+    const vgeo = new THREE.BoxGeometry(1, 1, 1);
+    const vox = new THREE.Mesh(vgeo, vmat); vox.frustumCulled = false;
+    const _m4 = new THREE.Matrix4(), _v3 = new THREE.Vector3();
+    vox.onBeforeRender = (r, s, cam) => { _m4.copy(vox.matrixWorld).invert(); U.camO.value.copy(cam.position).applyMatrix4(_m4);
+      U.uModel.value.copy(vox.matrixWorld); U.uMVP.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse).multiply(vox.matrixWorld);
+      U.nmat.value.setFromMatrix4(vox.matrixWorld); };
+    let texOp = -1, tex = null;
+    const useOp = (k) => { if (texOp === k) return; texOp = k; const op = opsT[k], [nx, ny, nz] = op.n, Nn = nx * ny * nz;
+      const d = new Uint16Array(Nn * 2); for (let i = 0; i < Nn; i++) { d[2 * i] = op.code[i]; d[2 * i + 1] = op.gt[i]; }
+      if (tex) tex.dispose();
+      tex = new THREE.Data3DTexture(d, nx, ny, nz); tex.format = THREE.RGIntegerFormat; tex.type = THREE.UnsignedShortType; tex.internalFormat = 'RG16UI';
+      tex.minFilter = tex.magFilter = THREE.NearestFilter; tex.generateMipmaps = false; tex.unpackAlignment = 1; tex.needsUpdate = true;
+      U.vox.value = tex; U.lo.value.set(op.lo[0], op.lo[1], op.lo[2]); U.hh.value = op.h; U.N.value.set(nx, ny, nz);
+      vgeo.copy(new THREE.BoxGeometry(nx * op.h, ny * op.h, nz * op.h).translate(op.lo[0] + nx * op.h / 2, op.lo[1] + ny * op.h / 2, op.lo[2] + nz * op.h / 2));
+      setFixture(k); };
+    // ---- makine + bağlama
+    const add2 = (geo, mat, x, y, z, parent) => add(geo, mat, x, y, z, parent);
+    const g3 = new THREE.Group(), g5 = new THREE.Group(); scene.add(g3); scene.add(g5);
+    const room = new THREE.Group(); scene.add(room);
+    const zFloor = -150;
+    { const wb = new THREE.Mesh(new THREE.PlaneGeometry(900, 600), mWall); wb.rotation.x = Math.PI / 2; wb.position.set(0, 210, 80); wb.receiveShadow = true; room.add(wb);
+      const led = add(boxG(500, 4, 6), new THREE.MeshBasicMaterial({ color: 0xf2f6ff }), 0, 206, 300, room); led.castShadow = false;
+      add(boxG(1000, 800, 4), mSlot, 0, 0, zFloor - 60, room); }
+    // 3 eksen: tabla + mengene (bağlamaya göre yeniden kurulur)
+    const v3 = new THREE.Group(); g3.add(v3);
+    const tableAt = (grp, zT) => { const tL = 560, tW = 300, tTh = 40, swd = 14, spc = 63, sd = 12;
+      add(boxG(tL, tW, tTh - sd), mTable, 0, 0, zT - sd - (tTh - sd) / 2, grp);
+      let ya = -tW / 2; for (let k = -2; k <= 3; k++) { const yc = k <= 2 ? k * spc : null, yb = yc === null ? tW / 2 : yc - swd / 2;
+        if (yb > ya) add(boxG(tL, yb - ya, sd), mTable, 0, (ya + yb) / 2, zT - sd / 2, grp);
+        if (yc !== null) { add(boxG(tL, swd, 0.6), mSlot, 0, yc, zT - sd + 0.3, grp); ya = yc + swd / 2; } } };
+    const buildVise3 = (fx) => { v3.clear(); const [x0, x1, y0, y1] = fx.ext, zb = fx.z0 - 12, jw = 130, jd = 18, jt = fx.z1;
+      add(boxG(150, 210, 42), mVise, 0, 20, zb - 21, v3);
+      add(boxG(jw * 0.9, 150, 0.8), mGround, 0, 10, zb + 0.4, v3);
+      for (const sg of [-1, 1]) { const yj = sg < 0 ? y0 : y1;
+        add(boxG(jw, 4, jt - zb), mGround, 0, yj + sg * 2, (jt + zb) / 2, v3);
+        add(boxG(jw, jd, jt - zb - 2), mVise, 0, yj + sg * (4 + jd / 2), (jt - 2 + zb) / 2, v3);
+        for (const sx of [-1, 1]) { const b = add(new THREE.CylinderGeometry(3.2, 3.2, 1, 16), mBolt, sx * jw * 0.3, yj + sg * 4.2, (jt + zb) / 2, v3); b.rotation.x = Math.PI / 2; }
+        add(boxG(Math.min(x1 - x0 + 10, jw * 0.95), 3, fx.z0 - zb), mGround, (x0 + x1) / 2, yj - sg * 2.2, (fx.z0 + zb) / 2, v3); }
+      { const s = add(new THREE.CylinderGeometry(7, 7, 40, 24), mGround, 0, 125 + 20, zb - 18, v3); s.rotation.x = Math.PI / 2; }
+      while (g3.children.length > 1) g3.remove(g3.children[1]);
+      const tg = new THREE.Group(); g3.add(tg); tableAt(tg, zb - 42); return zb - 42; };
+    // 5 eksen: masa + muylu (B) + C tabla + 5 eksen mengene
+    const fx1 = (opsT.find(o => o.axes === 5) || opsT[0]).fix;
+    const zc = fx1.z0 - 24; const PV = new THREE.Vector3(0, 0, zc);
+    const cradle = new THREE.Group(), inner = new THREE.Group(), ctab = new THREE.Group();
+    g5.add(cradle); cradle.position.copy(PV); cradle.add(inner); inner.position.set(0, 0, -zc); inner.add(ctab);
+    { const zT = zc - 95; tableAt(g5, zT);
+      // döner tablalı 5 eksen (B/C): B ekseni gövdesi arkada (+Y), tabla Y ekseni etrafında devrilir, üstünde C döner tabla
+      const hTop = zc + 58, hH = hTop - zT;
+      add(boxG(170, 46, hH), mBlue, 0, 109, zT + hH / 2, g5);                       // B gövdesi
+      add(boxG(200, 70, 14), mBlue, 0, 100, zT + 7, g5);                            // gövde ayağı (tablaya cıvatalı)
+      add(boxG(84, 56, 60), mDark, 0, 160, zc + 6, g5);                             // B motoru
+      add(new THREE.CylinderGeometry(56, 56, 6, 56), mGround, 0, 83, zc, g5);        // B yatağı kapağı
+      for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; add(new THREE.CylinderGeometry(2.6, 2.6, 2, 10), mBolt, Math.cos(a) * 50, 79.5, zc + Math.sin(a) * 50, g5); }
+      // B ile dönen kısım: flanş + kol + C tabla gövdesi
+      add(new THREE.CylinderGeometry(46, 46, 10, 56), mSteel, 0, 75, zc, inner);    // B flanşı
+      add(boxG(120, 18, 96), mBlue, 0, 61, zc - 22, inner);                          // kol (flanştan C gövdesine)
+      { const cb = add(new THREE.CylinderGeometry(70, 70, 40, 64), mBlue, 0, 0, zc - 16 - 20, inner); cb.rotation.x = Math.PI / 2; }   // C tabla gövdesi
+      { const r = add(new THREE.CylinderGeometry(71, 71, 3, 64), mDark, 0, 0, zc - 17.5, inner); r.rotation.x = Math.PI / 2; }        // C yatak bileziği
+      add(boxG(120, 40, 36), mBlue, 0, 48, zc - 16 - 22, inner);                     // kol ile gövde bağlantısı
+      const disk = add(new THREE.CylinderGeometry(62, 62, 16, 64), mTable, 0, 0, zc - 8, ctab); disk.rotation.x = Math.PI / 2;
+      for (let k = 0; k < 4; k++) { const s = add(boxG(110, 8, 0.6), mSlot, 0, 0, zc + 0.31, ctab); s.rotation.z = k * Math.PI / 4; }
+      const [x0, x1, y0, y1] = fx1.ext;
+      add(boxG(78, 70, fx1.z0 - zc), mVise, 0, 0, (fx1.z0 + zc) / 2, ctab);
+      add(boxG(60, 50, 0.6), mGround, 0, 0, fx1.z0 - 0.3, ctab);
+      for (const sg of [-1, 1]) { const yj = sg < 0 ? y0 : y1;
+        add(boxG(46, 16, fx1.z1 - fx1.z0 + 6), mGround, 0, yj + sg * 8, (fx1.z1 + fx1.z0 - 6) / 2, ctab);
+        const b = add(new THREE.CylinderGeometry(3.4, 3.4, 1, 16), mBolt, 0, yj + sg * 16.2, (fx1.z1 + fx1.z0 - 4) / 2, ctab); b.rotation.x = Math.PI / 2; } }
+    let zBed3 = -60;
+    const setFixture = (k) => { const op = opsT[k];
+      if (op.axes === 5) { g3.visible = false; g5.visible = true; ctab.add(vox); }
+      else { g5.visible = false; g3.visible = true; zBed3 = buildVise3(op.fix); scene.add(vox); vox.position.set(0, 0, 0); vox.rotation.set(0, 0, 0); } };
+    // ---- takım
+    const tool = new THREE.Group(); scene.add(tool); const rot = new THREE.Group(); tool.add(rot); const head = new THREE.Group(); tool.add(head);
+    const mHold = M(0x2c3138, 0.8, 0.3), mNut = M(0xdfe3e8, 0.95, 0.16), mHead = M(0xd6dade, 0.25, 0.42), mNose = M(0x383d45, 0.65, 0.32), mCarb = M(0xa3aab3, 0.9, 0.26), mHose = M(0x2f6fb0, 0.2, 0.6), mNoz = M(0xe8a23a, 0.3, 0.5);
+    const cyl = (rt, rb, h, seg, mat, z, parent) => { const o = add(new THREE.CylinderGeometry(rt, rb, h, seg), mat, 0, 0, z, parent); o.rotation.x = Math.PI / 2; return o; };
+    const rf = 22;
+    cyl(rf * 1.3, rf * 1.34, 5, 40, mNose, 2.5, head); cyl(rf * 1.5, rf * 1.5, 14, 40, mNose, 12, head);
+    cyl(rf * 1.95, rf * 1.95, 70, 48, mHead, 54, head); add(boxG(rf * 5, rf * 4.4, 120), mHead, 0, rf * 1.2, 150, head);
+    let cutter = null, curTool = -1, NZ = [];
+    const disp = (g) => g && g.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material && o.material.userData.tmp) o.material.dispose(); });
+    const setTool = (gi) => { if (gi === curTool) return; curTool = gi; if (cutter) { rot.remove(cutter); disp(cutter); } const t = tools[gi]; if (!t) return;
+      const r = t.d / 2, tc = new THREE.Color(t.col); cutter = new THREE.Group(); rot.add(cutter);
+      const cm = new THREE.MeshStandardMaterial({ color: new THREE.Color(0xd0d6dd).lerp(tc, 0.3), metalness: 0.85, roughness: 0.28, emissive: tc.clone().multiplyScalar(0.08) }); cm.userData.tmp = 1;
+      const band = new THREE.MeshStandardMaterial({ color: tc, metalness: 0.3, roughness: 0.4, emissive: tc.clone().multiplyScalar(0.3) }); band.userData.tmp = 1;
+      const len = Math.max(t.d * 3, 8), tipH = t.kind === 'drill' ? r * 0.6 : t.kind === 'spot' ? r : 0;
+      if (tipH) { cyl(r, r, len - tipH, 20, cm, tipH + (len - tipH) / 2, cutter); cyl(r, 0.02, tipH, 20, cm, tipH / 2, cutter); } else cyl(r, r, len, 20, cm, len / 2, cutter);
+      const rs = Math.max(r, 2), Ls = 14; if (rs > r) cyl(rs, r, 2, 20, mCarb, len + 1, cutter); cyl(rs, rs, Ls, 20, mCarb, len + 2 + Ls / 2, cutter);
+      cyl(rs * 1.05, rs * 1.05, 2, 20, band, len + 2 + Ls * 0.35, cutter);
+      const zn = len + 2 + Ls * 0.6, rn = Math.max(rs * 1.9, 9), hn = 10; cyl(rn, rn, hn, 30, mNut, zn + hn / 2, cutter);
+      const hc = 28; cyl(rf * 0.7, rn * 0.95, hc, 32, mHold, zn + hn + hc / 2, cutter);
+      const zf = zn + hn + hc; cyl(rf, rf, 4, 40, mHold, zf + 2, cutter); cyl(rf * 0.85, rf * 0.85, 6, 40, mHold, zf + 7, cutter); cyl(rf, rf, 4, 40, mHold, zf + 12, cutter);
+      head.position.z = zf + 14;
+      disp(hoseG); hoseG.clear(); NZ = []; const tz = Math.max(len * 0.8, 6);
+      for (const a of [-0.15, -1.9]) { const ca = Math.cos(a), sa = Math.sin(a), rr2 = r + 6;
+        const b = [ca * rf * 1.3, sa * rf * 1.3, zf + 16], e = [ca * rf * 1.25, sa * rf * 1.25, tz + (zf + 16 - tz) * 0.45], tp = [ca * rr2, sa * rr2, tz + 2];
+        const m = [tp[0] + (e[0] - tp[0]) * 0.22, tp[1] + (e[1] - tp[1]) * 0.22, tp[2] + (e[2] - tp[2]) * 0.22];
+        hoseTo(THREE, hoseG, mHose, b, e, 1.8); hoseTo(THREE, hoseG, mHose, e, m, 1.6); hoseTo(THREE, hoseG, mNoz, m, tp, 1.1); NZ.push(tp); } };
+    const hoseG = new THREE.Group(); tool.add(hoseG);
+    // ---- talaş / soğutma
+    const floorAt = (x, y) => { const op = opsT[Math.max(0, curOp)]; if (op && op.axes === 3) return (Math.abs(x) < 70 && y > -40 && y < 230) ? zBed3 + 0.5 : zBed3 - 42; return zc - 95; };
+    const fx = makeFX(scene, span, mi.col, floorAt);
+    // ---- durum
+    let curOp = -1; const toolW = new THREE.Vector3(0, 0, 80), Mr = new THREE.Matrix4(), Mz = new THREE.Matrix4(), ctr = new THREE.Vector3(0, 0, -17), ctrS = new THREE.Vector3(0, 0, -17);
+    let cutting = false, lastB = 0, lastC = 0, fly = 0;
+    const kfFind = (op, u) => { const kt = op.kt; let a = 0, b = kt.length - 1; if (u <= kt[0]) return 0; if (u >= kt[b]) return b; while (b - a > 1) { const m = (a + b) >> 1; if (kt[m] < u) a = m; else b = m; } return b; };
+    const opIdx = (t) => { let k = 0; for (let i = 0; i < opsT.length; i++) if (t >= opsT[i].T0) k = i; return k; };
+    const apply = (t, dt) => { const k = opIdx(t), op = opsT[k]; if (k !== curOp) { curOp = k; useOp(k); }
+      const u = t - op.Tp; let B = 0, C = 0, p = [0, 0, 80], gi = Math.max(0, (op.subs[0] || { tool: 1 }).tool - 1); cutting = false;
+      if (u < 0) { U.tq.value = 0; const a = clamp((t - op.T0) / Math.min(4, op.load * 0.5), 0, 1); fly = (1 - a * a * (3 - 2 * a)); p = [0, 0, 80]; }
+      else { fly = 0; U.tq.value = Math.min(65534, 1 + Math.floor(clamp(u / op.dur, 0, 1) * 65000));
+        const i = kfFind(op, u), j = Math.max(0, i - 1), ta = i ? op.kt[j] : 0, tb = op.kt[i], f = clamp((u - ta) / Math.max(1e-6, tb - ta), 0, 1);
+        const pa = i ? [op.kp[j * 3], op.kp[j * 3 + 1], op.kp[j * 3 + 2]] : [0, 0, 60], pb = [op.kp[i * 3], op.kp[i * 3 + 1], op.kp[i * 3 + 2]];
+        p = [pa[0] + (pb[0] - pa[0]) * f, pa[1] + (pb[1] - pa[1]) * f, pa[2] + (pb[2] - pa[2]) * f];
+        const Ba = i ? op.kbc[j * 2] : 0, Ca = i ? op.kbc[j * 2 + 1] : 0; B = Ba + (op.kbc[i * 2] - Ba) * f; C = Ca + (op.kbc[i * 2 + 1] - Ca) * f;
+        gi = op.ktool[i] - 1; cutting = !!op.kcut[i] && u < op.dur; }
+      setTool(gi);
+      // tabla dönüşü: dünya = PV + Ry(-B) Rz(-C) (p - PV)
+      if (op.axes === 5) { cradle.rotation.set(0, -B * Math.PI / 180, 0); ctab.rotation.set(0, 0, -C * Math.PI / 180);
+        Mr.makeRotationY(-B * Math.PI / 180).multiply(Mz.makeRotationZ(-C * Math.PI / 180));
+        _v3.copy(PV).applyMatrix4(Mr); toolW.set(p[0] + PV.x - _v3.x, p[1] + PV.y - _v3.y, p[2] + PV.z - _v3.z);
+        ctr.set(0, 0, -17).sub(PV).applyMatrix4(Mr).add(PV); }
+      else { toolW.set(p[0], p[1], p[2]); ctr.set(0, 0, (op.top + op.bot) / 2); }
+      vox.position.z = fly * 90;
+      lastB = B; lastC = C; };
+    const center0 = new THREE.Vector3(0, 0, -17);
+    fit(center0.x, center0.y, center0.z, 100, 0.65, -1, 0.8); controls.maxDistance = span * 7; controls.minDistance = span * 0.3;
+    sun.position.set(-span, -span * 1.4, span * 2.5); sun.target.position.copy(center0);
+    Object.assign(sun.shadow.camera, { left: -span * 2, right: span * 2, top: span * 2, bottom: -span * 2, near: 1, far: span * 10 }); sun.shadow.camera.updateProjectionMatrix();
+    fill.position.set(span, span, span);
+    const follow = (dt) => { const a = dt > 0 ? 1 - Math.exp(-dt * 3) : 1; const d = _v3.copy(ctr).sub(ctrS).multiplyScalar(a); ctrS.add(d); controls.target.add(d); camera.position.add(d); };
+    const nzW = () => NZ.map(n => new THREE.Vector3(toolW.x + n[0], toolW.y + n[1], toolW.z + n[2]));
+    let chipAcc = 0;
+    return {
+      total, ops: opAt, tools, setups: opsT.length, info: { nc: true },
+      fx,
+      seek(t) { apply(t, 0); tool.position.copy(toolW); follow(0); },
+      tick(t, dt, now) { apply(t, dt); tool.position.copy(toolW); rot.rotation.z += dt * (cutting ? 60 : 8); follow(dt);
+        if (cutting && dt > 0) { chipAcc += dt * 14; while (chipAcc >= 1) { chipAcc--; fx.chips(toolW.x, toolW.y, toolW.z + 0.5, 1); } }
+        fx.step(dt, nzW(), new THREE.Vector3(toolW.x, toolW.y, toolW.z + 1), cutting || (t - opsT[curOp].Tp) > 0); },
+      reset() { apply(0, 0); tool.position.copy(toolW); },
+      finish() { this._z0 = toolW.z; },
+      present(u, dt) { const e1 = clamp(u / 0.35, 0, 1), s1 = e1 * e1 * (3 - 2 * e1); toolW.z = (this._z0 || 60) + 90 * s1; tool.position.copy(toolW);
+        rot.rotation.z += dt * 30 * (1 - s1); vox.rotation.z += dt * 0.6 * s1; fx.step(dt, nzW(), new THREE.Vector3(toolW.x, toolW.y, toolW.z), false); },
+      setupAt(t) { return opIdx(t); }
+    };
+  }
+
+  // ---------------------------------------------------------------- döngü
+  // ---- video kaydı: WebGL karesi + bilgi yazıları 2D tuvale çizilir, MediaRecorder ile kaydedilir
+  let REC = null;
+  const makeRec = (o) => { const src = renderer.domElement, W = 720, Hh = Math.min(1280, Math.round(W * src.height / Math.max(1, src.width) / 2) * 2);
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = Hh; const g = cv.getContext('2d');
+    const types = ['video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    const mime = window.MediaRecorder ? types.find(t => MediaRecorder.isTypeSupported(t)) : null; if (!mime || !cv.captureStream) throw new Error('nosupport');
+    const st = cv.captureStream(30), mr = new MediaRecorder(st, { mimeType: mime, videoBitsPerSecond: 4000000 }), chunks = []; let res; const done = new Promise(r => res = r);
+    mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); }; mr.onstop = () => res(new Blob(chunks, { type: mime.split(';')[0] }));
+    const F = 'system-ui, -apple-system, Roboto, sans-serif', rr = (x, y, w, h, r) => { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); };
+    const chip = (x, y, txt, fg, font) => { g.font = font; const w = g.measureText(txt).width + 24; g.fillStyle = 'rgba(20,23,29,.82)'; rr(x, y, w, 36, 11); g.fill(); g.fillStyle = fg; g.fillText(txt, x + 12, y + 25); return x + w + 8; };
+    mr.start(1000);
+    return { mime, done, untilDone: !!o.untilDone, stop() { if (mr.state !== 'inactive') mr.stop(); st.getTracks().forEach(t => t.stop()); },
+      draw(fi) { g.drawImage(src, 0, 0, W, Hh);
+        let gr = g.createLinearGradient(0, 0, 0, 190); gr.addColorStop(0, 'rgba(12,14,18,.92)'); gr.addColorStop(1, 'rgba(12,14,18,0)'); g.fillStyle = gr; g.fillRect(0, 0, W, 190);
+        gr = g.createLinearGradient(0, Hh - 170, 0, Hh); gr.addColorStop(0, 'rgba(12,14,18,0)'); gr.addColorStop(1, 'rgba(12,14,18,.95)'); g.fillStyle = gr; g.fillRect(0, Hh - 170, W, 170);
+        g.fillStyle = '#fff'; g.font = '700 32px ' + F; g.fillText(o.title || '', 24, 46); g.fillStyle = '#aab4c0'; g.font = '500 20px ' + F; g.fillText(o.sub || '', 24, 76);
+        if (o.badge) { g.font = '700 20px ' + F; const w = g.measureText(o.badge).width + 24; g.fillStyle = '#ff8c28'; rr(W - 24 - w, 22, w, 34, 10); g.fill(); g.fillStyle = '#141414'; g.fillText(o.badge, W - 12 - w, 46); }
+        const T = o.tx || (v => v);
+        let x = chip(24, 94, (fi.setups > 1 ? T('Bağlama') + ' ' + fi.setup + '/' + fi.setups : T('Parça') + ' ' + fi.part + '/' + fi.qty), '#e8ecf1', '600 19px ' + F);
+        if (fi.op) chip(x, 94, String(T(fi.op)).slice(0, 46), '#f2b44c', '600 19px ' + F);
+        const tl = fi.tool ? T(fi.tool.name) : '', tc = fi.tool && fi.tool.col ? fi.tool.col : '#4c9aff';
+        g.fillStyle = tc; g.beginPath(); g.arc(32, Hh - 92, 8, 0, Math.PI * 2); g.fill(); g.fillStyle = '#e8ecf1'; g.font = '600 21px ' + F; g.fillText(tl, 48, Hh - 85);
+        const pc = '%' + Math.round(fi.frac * 100); g.fillStyle = '#c8ced6'; g.fillText(pc, W - 24 - g.measureText(pc).width, Hh - 85);
+        g.fillStyle = 'rgba(60,66,78,.9)'; rr(24, Hh - 64, W - 48, 10, 5); g.fill(); g.fillStyle = '#ff8c28'; rr(24, Hh - 64, Math.max(10, (W - 48) * Math.min(1, fi.frac)), 10, 5); g.fill();
+        g.fillStyle = '#96a0ae'; g.font = '500 17px ' + F; g.fillText('Talaş Atölyesi', 24, Hh - 22); if (o.foot) g.fillText(o.foot, W - 24 - g.measureText(o.foot).width, Hh - 22);
+        if (fi.done) { const m = T('✓ Parça tamam'); g.font = '700 36px ' + F; const w = g.measureText(m).width + 50; g.fillStyle = 'rgba(40,180,110,.92)'; rr((W - w) / 2, Hh * 0.36, w, 60, 16); g.fill(); g.fillStyle = '#fff'; g.fillText(m, (W - w) / 2 + 25, Hh * 0.36 + 42); } } }; };
+  let speed = spec.speed || 1, playing = true, partNo = spec.progress ? spec.progress.part : 1, qty = spec.progress ? spec.progress.qty : 1;
+  const PLAY = clamp(api.total, 1, 1e9), DUR = clamp(spec.duration || 75, 20, 7200), k = PLAY / DUR;   // 1× hızda bir parça ~DUR saniye
+  let t = (spec.progress ? clamp(spec.progress.frac, 0, 0.98) : 0) * PLAY;
+  api.seek(t); if (api.fx) api.fx.setOn(spec.coolant !== false);
+  let raf = 0, last = performance.now(), doneHold = 0, alive = true; const HOLD = 4.5;
+  // uyarlamalı kalite: telefon yetişemezse önce çözünürlük, sonra yansıma + gölge kapanır
+  let qLvl = 0, fN = -40, fT = 0;
+  const degrade = () => { qLvl++;
+    if (qLvl === 1) { renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25)); resize(); return; }
+    renderer.setPixelRatio(1); resize(); renderer.shadowMap.enabled = false;
+    const hadEnv = !!scene.environment; scene.environment = null;
+    scene.traverse(o => { if (o.isHemisphereLight && hadEnv) o.intensity = 1.2; const m = o.material; if (m) { (Array.isArray(m) ? m : [m]).forEach(x => { if (hadEnv && x.metalness > 0.4) x.metalness = 0.3; x.needsUpdate = true; }); } }); };
+  const resize = () => { const w = el.clientWidth || 300, h = el.clientHeight || 300; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); };
+  resize(); const ro = new ResizeObserver(resize); ro.observe(el);
+  const opName = () => { let o = api.ops[0]; for (const x of api.ops) if (x.t <= t) o = x; return o; };
+  const loop = (now) => { if (!alive) return; raf = requestAnimationFrame(loop); const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    if (playing) { if (doneHold > 0) { doneHold -= dt; if (api.present) api.present(clamp(1 - doneHold / HOLD, 0, 1), dt);
+        if (doneHold <= 0) { if (REC && REC.untilDone) { const R = REC; REC = null; R.stop(); } controls.autoRotate = false; if (partNo < qty) partNo++; t = 0; api.reset(); } }
+      else { t += dt * k * speed; if (t >= PLAY) { t = PLAY; api.tick(t, dt, now); if (api.finish) api.finish(); doneHold = HOLD; controls.autoRotate = true; controls.autoRotateSpeed = 3; spec.onPartDone && spec.onPartDone(partNo); } else api.tick(t, dt, now); } }
+    else api.tick(t, 0, now);
+    controls.update(); renderer.render(scene, camera);
+    if (REC) { const o = opName(); try { REC.draw({ frac: t / PLAY, part: partNo, qty, op: o ? o.name : '', tool: o ? api.tools[o.tool] : null, setup: api.setupAt(t) + 1, setups: api.setups, done: doneHold > 0 }); } catch (e) { } }
+    if (qLvl < 2 && dt > 0) { fN++; if (fN > 0) { fT += dt; if (fN >= 60) { if (fT / fN > 1 / 38) degrade(); fN = 0; fT = 0; } } }
+    if (spec.onFrame) { const o = opName(); spec.onFrame({ frac: t / PLAY, part: partNo, qty, op: o ? o.name : '', info: o && o.info || '', tool: o ? api.tools[o.tool] : null, setup: api.setupAt(t) + 1, setups: api.setups, done: doneHold > 0 }); } };
+  raf = requestAnimationFrame(loop);
+  return {
+    setSpeed(s) { speed = s; }, toggle() { playing = !playing; return playing; },
+    restart() { t = 0; doneHold = 0; playing = true; controls.autoRotate = false; api.reset(); api.seek(0); },
+    startRec(o) { if (!REC) REC = makeRec(o || {}); return REC; },
+    stopRec() { if (!REC) return null; const R = REC; REC = null; R.stop(); return R.done; },
+    get recording() { return !!REC; },
+    setCoolant(b) { if (api.fx) api.fx.setOn(b); return api.fx ? api.fx.on : false; },
+    tools: api.tools, info: api.info,
+    close() { if (REC) { try { REC.stop(); } catch (e) { } REC = null; } alive = false; cancelAnimationFrame(raf); ro.disconnect(); controls.dispose(); renderer.dispose(); scene.traverse(o => { if (o.geometry) o.geometry.dispose(); }); el.innerHTML = ''; }
+  };
+}
+export const _test = { procMill, planMill, procLathe, planLathe, loadHM, loadNC };
