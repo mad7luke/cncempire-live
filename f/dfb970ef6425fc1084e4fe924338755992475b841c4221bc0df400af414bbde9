@@ -666,7 +666,7 @@ function langRow(){ return `<div class="row" data-notr style="justify-content:fl
 function langSheet(){ showSheet(()=>`<div data-notr><div style="font-size:30px">🌐</div><b style="font-size:18px">Dil seç · Choose language · 选择语言</b>
   ${Object.entries(LANGS).map(([k,n])=>`<button class="btn ${k===LANG?'':'ghost'}" style="display:block;width:100%;margin-top:10px;padding:14px;font-size:16px" onclick="setLang('${k}')">${n}</button>`).join('')}</div>`); }
 // ---- test sürümü: hata kaydı + anonim oyun istatistikleri (Google Sheets'e) ----
-const GAME_VER='2.28.6';
+const GAME_VER='2.28.7';
 const TELE_URL='https://script.google.com/macros/s/AKfycbxQheLNAn_7CARaLyatv_wJAgixPA-aAJOzqLby-qCoRZD6Ub879ByzPYluXyyY7vnq/exec';   // Google Apps Script web uygulaması adresi (boşsa istatistik gönderilmez)
 function errLog(){ try{ return JSON.parse(localStorage.getItem('ta5_err')||'[]'); }catch(e){ return []; } }
 function errPush(m){ try{ const L=errLog(); L.unshift({t:Date.now(),d:S&&S.day,m:String(m).slice(0,300)}); localStorage.setItem('ta5_err',JSON.stringify(L.slice(0,20))); }catch(e){} try{ tele('err',{m:String(m).slice(0,300)}); }catch(e){} }
